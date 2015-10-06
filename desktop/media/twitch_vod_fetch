@@ -369,7 +369,7 @@ def vod_fetch(url, file_prefix,
 				for chunk in chunks:
 					shutil.copyfileobj(open(chunk, "rb"), dst)
 			else:
-				subprocess.check_call(['cat'] + chunks, stdout=dst, close_fds=True)
+				subprocess.check_call(['cat'] + chunks, stdout=dst, close_fds=not mswindows)
 		os.rename(dst_file_tmp, dst_file)
 
 	## ffmpeg otoh makes file unplayable on the second pass, well done!
