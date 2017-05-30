@@ -7,6 +7,15 @@ import asyncio, asyncio.subprocess, socket, signal, heapq, struct
 
 import aiohttp
 
+is_windows = sys.platform == 'win32'
+
+if is_windows:
+	# Use the Proactor event loop on Windows for subprocess support
+	loop = asyncio.ProactorEventLoop()
+	asyncio.set_event_loop(loop)
+	
+	# Define the EX_OK constant
+	os.EX_OK = 0
 
 class TVFConfig:
 
@@ -263,8 +272,8 @@ async def vod_fetch(loop, conf, vod_queue, list_formats_only=False):
 		nonlocal exit_code
 		exit_code = code
 		task.cancel()
-	for sig, code in ('INT', 1), ('TERM', 0):
-		loop.add_signal_handler(getattr(signal, f'SIG{sig}'), ft.partial(sig_handler, sig, code))
+	# for sig, code in ('INT', 1), ('TERM', 0): # AbstractEventLoop.add_signal_handler isn't supported on Windows
+		# loop.add_signal_handler(getattr(signal, f'SIG{sig}'), ft.partial(sig_handler, sig, code))
 	async with TVF(loop, conf, log) as fetcher:
 		fetch = fetcher.get if not list_formats_only else fetcher.ytdl_probe_formats
 		for n, (url, prefix) in enumerate(vod_queue, 1):
@@ -727,7 +736,13 @@ class TVF:
 					file_dst_mark.seek(0)
 					file_dst_mark.write(struct.pack(file_dst_mark_fmt, file_dst_pos, file_dst_seq))
 					file_dst_mark.flush()
-					os.fdatasync(file_dst_mark.fileno())
+					
+					if is_windows: # os.fdatasync isn't supported on Windows
+						os.fsync(file_dst_mark.fileno())
+					else:
+						os.fdatasync(file_dst_mark.fileno())
+						
+					self.log.debug('Unlinking chunk files. Finished? {}', chunks.finished)
 					for p in seq_chunks: os.unlink(p)
 					# self.log.debug('\nExtended partial dst file by {} chunk(s)', len(seq_chunks))
 					seq_chunks.clear()
