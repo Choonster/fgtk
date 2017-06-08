@@ -1740,9 +1740,9 @@ twitch_vod_fetch
 
 Script to download any time slice of a twitch.tv VoD (video-on-demand).
 
-This is a unix-ish OS version, though it might work on windows as well,
-otherwise check out `Choonster's fork of this repo`_ for a tested and working
-windows version.
+This is the latest version that's been tested and confirmed to work on Windows,
+see `mk-fg's repository`_ for the absolute latest version (which has been tested
+on a Unix-like OS and may or may not work on Windows).
 
 youtube-dl_ - the usual tool for the job - `doesn't support neither seeking to
 time nor length limits`_, but does a good job of getting a VoD m3u8 playlist
@@ -1795,7 +1795,7 @@ General usage examples (wrapped)::
 | Needs Python-3.6+, youtube-dl_, `aiohttp <https://aiohttp.readthedocs.io/>`_ and aria2_.
 | A bit more info (on its previous py2 version) can be found in `this twitchtv-vods-... blog post`_.
 
-.. _Choonster's fork of this repo: https://github.com/Choonster/fgtk#twitch-vod-fetch
+.. _mk-fg's repository: https://github.com/mk-fg/fgtk#twitch-vod-fetch
 .. _youtube-dl: https://rg3.github.io/youtube-dl/
 .. _doesn't support neither seeking to time nor length limits: https://github.com/rg3/youtube-dl/issues/622
 .. _aria2: http://aria2.sourceforge.net/
