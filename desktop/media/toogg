@@ -3,7 +3,7 @@
 import itertools as it, operator as op, functools as ft
 from collections import OrderedDict, namedtuple
 from asyncio import subprocess
-import os, sys, re, logging
+import os, sys, re, logging, pathlib
 import contextlib, asyncio, signal, json, tempfile, shutil
 
 
@@ -29,14 +29,14 @@ class FFProc:
 
 	proc = finished = None
 	stream_reader_limit = 32 * 2**10
-	crop_mark = '... ¯\_(ツ)_/¯'
+	prefix, crop_mark = '', '... ¯\_(ツ)_/¯'
 
 	def __init__( self, loop, src, cmd,
 			stream_len=None, progress_func=None, prefix=None, limit=None, **kws ):
 		self.loop, self.src, self.cmd, self.kws = loop, src, cmd, kws
 		self.progress_func, self.stream_len = progress_func, stream_len
 		self.term_width = shutil.get_terminal_size()[0] - 2
-		self.prefix = prefix or ''
+		if prefix: self.prefix = prefix
 		self.line_max_len = self.kws['limit'] = limit or self.stream_reader_limit
 		self.cmd_repr = ' '.join((v if len(v.split()) == 1 else repr(v)) for v in cmd)
 
@@ -105,6 +105,17 @@ class FFProc:
 		return line
 
 
+	def print_progress_prefix(self, msg):
+		prefix_max_len = self.term_width - len(msg)
+		if prefix_max_len >= len(self.prefix) + 10:
+			prefix_len, prefix = prefix_max_len - len(self.prefix) - 6, repr(self.src)
+			if len(prefix) > prefix_len: prefix = prefix[:prefix_len]
+			prefix = ' '.join(filter(None, [f'[{prefix}]', self.prefix]))
+			msg = f'{prefix}: {msg}'
+		elif prefix_max_len > 3: msg = '{}: {}'.format(self.prefix[:prefix_max_len-2], msg)
+		else: msg = msg[:self.term_width]
+		return msg
+
 	async def print_progress(self):
 		report, pos_str = dict(), lambda n:\
 			'{:02d}:{:02d}:{:02d}'.format(*map(int, [n//3600, (n%3600)//60, n%60]))
@@ -115,29 +126,41 @@ class FFProc:
 				if not line: return
 				k, v = line.split('=', 1)
 				report[k] = v
-				if k == 'progress':
-					pos = int(report.get('out_time_ms', 0)) / 1000000
-					if pos: # XXX: handle multiple files somehow
-						if not self.stream_len: msg = pos_str(pos)
-						else:
-							msg = '{:.1f}% - {} / {}'.format(
-								(pos / self.stream_len) * 100, pos_str(pos), pos_str(self.stream_len) )
-						prefix_max_len = self.term_width - len(msg)
-						if prefix_max_len >= len(self.prefix) + 10:
-							prefix_len, prefix = prefix_max_len - len(self.prefix) - 6, repr(self.src)
-							if len(prefix) > prefix_len: prefix = prefix[:prefix_len]
-							prefix = ' '.join(filter(None, ['[{}]'.format(prefix), self.prefix]))
-							msg = '{}: {}'.format(prefix, msg)
-						elif prefix_max_len > 3: msg = '{}: {}'.format(self.prefix[:prefix_max_len-2], msg)
-						else: msg = msg[:self.term_width]
-						print_progress(msg)
+				if k != 'progress': continue
+				pos = int(report.get('out_time_ms', 0)) / 1000000
+				if not pos: continue
+				# XXX: handle multiple files somehow
+				if not self.stream_len: msg = pos_str(pos)
+				else:
+					msg = '{:.1f}% - {} / {}'.format(
+						(pos / self.stream_len) * 100, pos_str(pos), pos_str(self.stream_len) )
+				msg = self.print_progress_prefix(msg)
+				print_progress(msg)
 		finally: print_progress()
+
+
+class YTDLProc(FFProc):
+
+	prefix = 'ytdl'
+
+	async def print_progress(self):
+		print_progress = ft.partial(self.progress_func, (self.src, self.prefix))
+		try:
+			while True:
+				line = await self.readline()
+				if not line: return
+				if not line.startswith('[download]'): continue
+				msg = self.print_progress_prefix(f'{line[10:].strip()}')
+				print_progress(msg)
+		finally: print_progress()
+
+
 
 
 class AudioConvError(Exception): pass
 
 class AudioConvJob:
-	__slots__ = 'name src dst input_opts tmp_file ffmpeg'.split()
+	__slots__ = 'name src dst input_opts tmp_file ffmpeg can_copy_stream'.split()
 	def __init__(self, *args, **kws):
 		for k,v in it.chain(zip(self.__slots__, args), kws.items()): setattr(self, k, v)
 
@@ -148,10 +171,12 @@ class AudioConv:
 		async with cls(*args, **kws) as self: return await self.run()
 
 	def __init__(self, loop, src_list,
-			start=None, length=None, loudnorm=False, loudnorm_opts=None, max_parallel=None ):
+			start=None, length=None, loudnorm=False,
+			loudnorm_opts=None, ytdl_opts=None, max_parallel=None ):
 		self.loop, self.src_list, self.max_parallel = loop, src_list, max_parallel or os.cpu_count()
 		self.start, self.length = start, length
 		self.loudnorm, self.loudnorm_opts = loudnorm, loudnorm_opts or ''
+		self.ytdl_opts = ytdl_opts or list()
 		self.status_lines = dict()
 
 	async def __aenter__(self):
@@ -226,7 +251,7 @@ class AudioConv:
 				except StopIteration:
 					src_iter = None
 					break
-				log.debug('Scheduling new conv-job for src: {!r}', src)
+				log.debug('Scheduling new conv-job for src: {}', src)
 				conv = self.conv_jobs[src] = self.loop.create_task(self.conv_src(src))
 				conv.src = src
 			if not self.conv_jobs: break
@@ -244,9 +269,31 @@ class AudioConv:
 
 
 	async def conv_src(self, src):
-		src_base = os.path.basename(src)
-		dst = src_base.rsplit('.', 1)[0] + '.ogg'
-		paths = {dst}
+		paths = set()
+
+		if not isinstance(src, pathlib.Path):
+			url, ytdl_opts = src, self.ytdl_opts
+			if not ytdl_opts:
+				ytdl_opts = ['-f', '171/bestaudio[ext=ogg]/bestaudio[ext=webm]/bestaudio/480p/best']
+			ytdl_opts = ['youtube-dl', '--newline'] + ytdl_opts
+			async with YTDLProc( self.loop, url,
+					ytdl_opts + ['--get-filename', url],
+					stdout=subprocess.PIPE ) as proc:
+				src = (await proc.stdout.read()).strip().decode()
+				await proc.finished
+			if not src or '\n' in src:
+				raise AudioConvError(f'Weird output from "youtube-dl --get-filename": {src!r}')
+			src = pathlib.Path(src)
+			try:
+				async with YTDLProc( self.loop, src.name,
+						ytdl_opts + [url], progress_func=self.status_line_set ) as proc:
+					await proc.finished
+			finally:
+				with contextlib.suppress(OSError): os.unlink(src.with_suffix('.part'))
+			paths.add(src)
+
+		dst = src.name.rsplit('.', 1)[0] + '.ogg'
+		paths.add(dst)
 
 		def tmp_file(ext):
 			p = '{}.{}'.format(dst, ext)
@@ -256,33 +303,39 @@ class AudioConv:
 		job_input_opts = list()
 		if self.start: job_input_opts.extend(['-ss', str(self.start)])
 		if self.length: job_input_opts.extend(['-t', str(self.length)])
-		job = AudioConvJob(src_base, src, dst, job_input_opts, tmp_file)
+		job = AudioConvJob(src.name, src, dst, job_input_opts, tmp_file)
 
 		async with FFProc( self.loop, job.name,
-				['ffprobe', '-v', 'error', '-show_entries',
-					'stream=codec_type,duration', '-print_format', 'json', job.src],
+				[ 'ffprobe', '-v', 'error', '-show_entries',
+					'stream=codec_type,codec_name,duration:format=duration',
+					'-print_format', 'json', str(src) ],
 				stdout=subprocess.PIPE ) as proc:
 			src_info = (await proc.stdout.read()).decode()
 			await proc.finished
-			src_duration = None
+			src_duration = src_codec = None
 			try:
 				src_info = json.loads(src_info)
 				for stream in src_info['streams']:
 					if stream.get('codec_type') != 'audio': continue
-					src_duration = float(stream['duration'])
+					src_duration = float(stream.get('duration', 0))
+					src_codec = stream.get('codec_name')
 					break
+				if not src_duration:
+					src_duration = float(src_info['format']['duration'])
 			except Exception as err:
 				log.error( '[{!r}] ffprobe failed, progress'
 					' info wont be available: [{}] {}', job.name, *err_with_type(err) )
 			if src_duration:
 				if self.start: src_duration = max(0, src_duration - self.start)
 				if self.length: src_duration = min(src_duration, self.length)
-			log.debug('[{!r}] Detected audio stream duration: {}', job.name, src_duration)
+			log.debug('[{!r}] Detected audio stream duration: {:.1f}s', job.name, src_duration)
+			log.debug('[{!r}] Detected audio stream codec: {!r}', job.name, src_codec)
 
 		ffmpeg_cmd = ['ffmpeg', '-v', 'error', '-hide_banner', '-y', '-progress', 'pipe:1']
 		job.ffmpeg = lambda pre, cmd_ext, **kws: FFProc(
-			self.loop, src_base, ffmpeg_cmd + cmd_ext, stream_len=src_duration,
+			self.loop, src.name, ffmpeg_cmd + cmd_ext, stream_len=src_duration,
 			prefix=pre, progress_func=self.status_line_set, **kws )
+		job.can_copy_stream = src_codec == 'vorbis'
 
 		func = self.conv_src_simple if not self.loudnorm else self.conv_src_loudnorm
 		try:
@@ -295,12 +348,14 @@ class AudioConv:
 
 
 	async def conv_src_simple(self, job):
-		await job.ffmpeg( 'to-ogg',
-			['-i', job.src] + job.input_opts + ['-vn', '-f', 'ogg', job.dst] ).run()
+		coding_opts = ['-vn']
+		if job.can_copy_stream: coding_opts += ['-codec:a', 'copy']
+		await job.ffmpeg( 'to-ogg', ['-i', str(job.src)]
+			+ job.input_opts + coding_opts + ['-f', 'ogg', job.dst] ).run()
 
 	async def conv_src_loudnorm(self, job):
 		await job.ffmpeg( 'to-wav [1/3]',
-			['-i', job.src] + job.input_opts + ['-f', 'wav', job.tmp_file('src.wav')] ).run()
+			['-i', str(job.src)] + job.input_opts + ['-f', 'wav', job.tmp_file('src.wav')] ).run()
 
 		ffmpeg_env = os.environ.copy()
 		ffmpeg_env['NO_COLOR'] = '1'
@@ -363,11 +418,21 @@ def main(args=None):
 			' Optionally uses ffmpeg "loudnorm" filter: https://ffmpeg.org/ffmpeg-all.html#loudnorm')
 
 	group = parser.add_argument_group('Source/destination')
-	group.add_argument('src', nargs='+', help='File(s) to convert.')
+	group.add_argument('src', nargs='+',
+		help='File(s) or URL(s) to convert.'
+			' Files that both dont exist and have ":" in the name'
+				' will be treated as URLs (to be processed with youtube-dl first).')
 	group.add_argument('-x', '--remove-src', action='store_true',
 		help='Remove source file(s) on success of the whole operation.')
 	group.add_argument('-t', '--dst-dir', metavar='path',
 		help='Path to store resulting files in. Defaults to current one.')
+	group.add_argument('-y', '--ytdl-opts',
+		action='append', metavar='opts',
+		help='Extra opts for youtube-dl command.'
+			' Will determine the name for resulting file from youtube-dl -o option.'
+			' Default is to override -f option for suitable audio formats,'
+				' but leave -o unspecified (i.e. use default or config file).'
+			' Will be split on spaces, unless option is used multiple times.')
 
 	group = parser.add_argument_group('Volume normalization')
 	group.add_argument('-n', '--loudnorm', action='store_true',
@@ -393,9 +458,14 @@ def main(args=None):
 
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
-	src_list = list(map(os.path.realpath, opts.src))
+	src_list = list(
+		(pathlib.Path(src).resolve() if os.path.exists(src) or ':' not in src else src)
+		for src in opts.src )
 	if opts.dst_dir: os.chdir(opts.dst_dir)
 	start, length = map(parse_pos_spec, [opts.start, opts.length])
+
+	ytdl_opts = opts.ytdl_opts or list()
+	if len(ytdl_opts) == 1: ytdl_opts = ytdl_opts[0].strip().split()
 
 	global log
 	logging.basicConfig(level=logging.DEBUG if opts.debug else logging.WARNING)
@@ -412,7 +482,7 @@ def main(args=None):
 	with contextlib.closing(asyncio.get_event_loop()) as loop:
 		success = loop.run_until_complete(
 			AudioConv.run_async( loop, src_list, start=start, length=length,
-				loudnorm=opts.loudnorm, loudnorm_opts=opts.loudnorm_opts ) )
+				loudnorm=opts.loudnorm, loudnorm_opts=opts.loudnorm_opts, ytdl_opts=ytdl_opts ) )
 	if success and opts.remove_src:
 		for src in src_list: os.unlink(src)
 

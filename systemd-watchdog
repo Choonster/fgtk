@@ -1,28 +1,208 @@
-#!/usr/bin/env python2
-#-*- coding: utf-8 -*-
-from __future__ import print_function
+#!/usr/bin/env python3
 
 import itertools as it, operator as op, functools as ft
 from systemd import daemon
 import os, sys, time, subprocess, tempfile
+import resource, socket, struct, ctypes as ct
 
 
-p_err = lambda tpl,*a,**k: print(tpl.format(*a, **kw), file=sys.stderr)
-dev_null = open(os.devnull, 'wb')
+p_err = lambda tpl,*a,**k: print(tpl.format(*a, **k), file=sys.stderr)
 
 
-def actions():
+class nlmsghdr(ct.Structure):
+	_fields_ = [
+		('len', ct.c_uint32),
+		('type', ct.c_uint16), ('flags', ct.c_uint16),
+		('seq', ct.c_uint32), ('pid', ct.c_uint32) ]
+
+class nlattr(ct.Structure):
+	_fields_ = [('len', ct.c_uint16), ('type', ct.c_uint16)]
+
+class rtgenmsg(ct.Structure):
+	_fields_ = [('family', ct.c_uint8)]
+
+class rtmsg(ct.Structure):
+	_fields_ = ( list( (k, ct.c_uint8) for k in
+			'family dst_len src_len tos table protocol scope type'.split() )
+		+ [('flags', ct.c_int)] )
+
+class mnl_socket(ct.Structure):
+	_fields_ = [('fd', ct.c_int), ('sockaddr_nl', ct.c_int)]
+
+class ifaddrmsg(ct.Structure):
+	_fields_ = [ ('family', ct.c_uint8), ('prefixlen', ct.c_uint8),
+		('flags', ct.c_uint8), ('scope', ct.c_uint8), ('index', ct.c_uint32) ]
+
+class LibMNL:
+
+	class c:
+		error = -1
+		netlink_route = 0
+		mnl_cb_error = -1
+		mnl_cb_stop = 0
+		mnl_cb_ok = 1
+		mnl_socket_autopid = 0
+		mnl_type_u32 = 3
+		mnl_type_binary = 11
+		nlm_f_request = 1
+		nlm_f_multi = 2
+		nlm_f_dump = 0x100|0x200
+		rta_dst = 1
+		rta_src = 2
+		rta_gateway = 5
+		rtm_getaddr = 22
+		rtm_getroute = 26
+		rtn_unicast = 1
+		rtn_local = 2
+		rtn_broadcast = 3
+		ifa_address = 1
+
+	_libmnl = None
+	@classmethod
+	def _get_lib(cls):
+		if cls._libmnl is None:
+			libmnl = cls._libmnl = ct.CDLL('libmnl.so.0.2.0', use_errno=True)
+			def _check(chk=lambda v: bool(v)):
+				def _check(res, func=None, args=None):
+					if not chk(res):
+						errno_ = ct.get_errno()
+						raise OSError(errno_, os.strerror(errno_))
+					return res
+				return _check
+			libmnl.mnl_nlmsg_put_header.restype = ct.POINTER(nlmsghdr)
+			libmnl.mnl_nlmsg_put_extra_header.restype = ct.POINTER(ct.c_void_p)
+			libmnl.mnl_nlmsg_next = ct.POINTER(nlmsghdr)
+			libmnl.mnl_attr_put_u32.argtypes = [ct.POINTER(nlmsghdr), ct.c_uint16, ct.c_uint32]
+			libmnl.mnl_socket_open.restype = mnl_socket
+			libmnl.mnl_socket_open.errcheck = _check()
+			libmnl.mnl_socket_bind.argtypes = [mnl_socket, ct.c_uint, ct.c_int32]
+			libmnl.mnl_socket_bind.errcheck = _check(lambda v: v >= 0)
+			libmnl.mnl_socket_get_portid.restype = ct.c_uint
+			libmnl.mnl_socket_get_portid.argtypes = [mnl_socket]
+			libmnl.mnl_socket_sendto.restype = ct.c_ssize_t
+			libmnl.mnl_socket_sendto.argtypes = [mnl_socket, ct.POINTER(nlmsghdr), ct.c_size_t]
+			libmnl.mnl_socket_sendto.errcheck = _check(lambda v: v >= 0)
+			libmnl.mnl_socket_recvfrom.restype = ct.c_ssize_t
+			libmnl.mnl_nlmsg_get_payload.restype = ct.POINTER(ct.c_void_p)
+			libmnl.mnl_attr_validate.errcheck = _check(lambda v: v >= 0)
+			libmnl.mnl_attr_get_payload.restype = ct.POINTER(ct.c_uint32)
+		return cls._libmnl
+
+	def __init__(self):
+		self._lib, self.nl = self._get_lib(), None
+		self.buf = ct.create_string_buffer(min(resource.getpagesize(), 8192))
+
+	def __getattr__(self, k):
+		if k.startswith('mnl_'): return getattr(self._lib, k)
+		raise AttributeError(k)
+
+	def __enter__(self):
+		self.open()
+		return self
+	def __exit__(self, *err): self.close()
+	def __del__(self): self.close()
+
+	def open(self):
+		self.nl = self.mnl_socket_open(self.c.netlink_route)
+		self.mnl_socket_bind(self.nl, 0, self.c.mnl_socket_autopid)
+		self.nl_port = self.mnl_socket_get_portid(self.nl)
+
+	def close(self):
+		if self.nl:
+			self.mnl_socket_close(self.nl)
+			self.nl = None
+
+	def make_req_nlh(self, req, msg_type, dump=False, family=socket.AF_INET):
+		nlh = self.mnl_nlmsg_put_header(self.buf)
+		nlh.contents.type = req
+		nlh.contents.flags = self.c.nlm_f_request
+		if dump: nlh.contents.flags |= self.c.nlm_f_dump
+		nlh.contents.seq = int(time.time())
+		rtm = self.mnl_nlmsg_put_extra_header(nlh, ct.sizeof(msg_type))
+		rtm = ct.cast(rtm, ct.POINTER(msg_type))
+		rtm.contents.family = family
+		return nlh, rtm
+
+	def send(self, nlh):
+		self.mnl_socket_sendto(self.nl, nlh, nlh.contents.len)
+
+	def recv(self, data_cb, seq, oneshot=False):
+		while True:
+			ret = self.mnl_socket_recvfrom(self.nl, self.buf, ct.sizeof(self.buf))
+			if ret <= 0: break
+			ret = self.mnl_cb_run(self.buf, ret, seq, self.nl_port, data_cb, None)
+			if oneshot or ret <= self.c.mnl_cb_stop: break
+		if ret == self.c.error: raise OSError(ct.get_errno(), os.strerror(ct.get_errno()))
+
+	def req(self, nlh, data_cb=None, **recv_kws):
+		seq = nlh.contents.seq
+		self.send(nlh)
+		self.recv(data_cb, seq, **recv_kws)
+
+	def cb_data_cast(self, data, load=False):
+		return ( ct.cast(ct.pointer(ct.py_object(data)), ct.c_void_p)
+			if not isinstance(data, ct.c_void_p) else
+			ct.cast(data, ct.POINTER(ct.py_object)).contents.value )
+
+
+def get_route_gw(libmnl, addr='8.8.8.8'):
+	addr_gw = None
+	nlh, rtm = libmnl.make_req_nlh(libmnl.c.rtm_getroute, rtmsg, dump=not addr)
+	if addr:
+		if '/' in addr: addr, cidr = addr.rsplit('/', 1)
+		else: cidr = 32
+		addr, = struct.unpack('=I', socket.inet_aton(addr))
+		libmnl.mnl_attr_put_u32(nlh, libmnl.c.rta_dst, addr)
+		rtm.contents.dst_len = int(cidr)
+	@ct.CFUNCTYPE(ct.c_int, ct.POINTER(nlattr), ct.c_void_p)
+	def data_ipv4_attr_cb(attr, data):
+		nonlocal addr_gw
+		if attr.contents.type == libmnl.c.rta_gateway:
+			libmnl.mnl_attr_validate(attr, libmnl.c.mnl_type_u32)
+			addr = libmnl.mnl_attr_get_payload(attr)
+			addr_gw = socket.inet_ntoa(struct.pack('=I', addr[0]))
+		return libmnl.c.mnl_cb_ok
+	@ct.CFUNCTYPE(ct.c_int, ct.POINTER(nlmsghdr), ct.c_void_p)
+	def data_cb(nlh, data):
+		rtm = ct.cast(libmnl.mnl_nlmsg_get_payload(nlh), ct.POINTER(rtmsg)).contents
+		if rtm.family == socket.AF_INET and rtm.type == libmnl.c.rtn_unicast:
+			libmnl.mnl_attr_parse(nlh, ct.sizeof(rtm), data_ipv4_attr_cb, None)
+		return libmnl.c.mnl_cb_ok
+	libmnl.req(nlh, data_cb, oneshot=True)
+	return addr_gw
+
+def get_iface_addrs(libmnl):
+	iface_addrs = dict()
+	nlh, rtm = libmnl.make_req_nlh(libmnl.c.rtm_getaddr, rtgenmsg, dump=True)
+	@ct.CFUNCTYPE(ct.c_int, ct.POINTER(nlattr), ct.c_int)
+	def data_ipv4_attr_cb(attr, iface_idx):
+		if attr.contents.type == libmnl.c.ifa_address:
+			libmnl.mnl_attr_validate(attr, libmnl.c.mnl_type_binary)
+			addr = socket.inet_ntoa(struct.pack('=I', libmnl.mnl_attr_get_payload(attr)[0]))
+			iface_addrs.setdefault(socket.if_indextoname(iface_idx), list()).append(addr)
+		return libmnl.c.mnl_cb_ok
+	@ct.CFUNCTYPE(ct.c_int, ct.POINTER(nlmsghdr), ct.c_void_p)
+	def data_cb(nlh, data):
+		ifa = ct.cast(libmnl.mnl_nlmsg_get_payload(nlh), ct.POINTER(ifaddrmsg)).contents
+		libmnl.mnl_attr_parse(nlh, ct.sizeof(ifa), data_ipv4_attr_cb, ifa.index)
+		return libmnl.c.mnl_cb_ok
+	libmnl.req(nlh, data_cb)
+	return iface_addrs
+
+
+def actions(check_net_gw=False):
 	## Any crash or hang here will be treated as a fatal failure
 	## These actions must take less time than systemd watchdog interval
 
 	# Processes can be forked and exec'ed and fs doesn't hang
-	subprocess.check_call(['/bin/true'])
+	subprocess.check_call(['/usr/bin/true'])
 	subprocess.check_call(
-		['/bin/ls', '-lah', '/', '/usr', '/var', '/etc', '/srv', '/home', '/dev'], stdout=dev_null )
+		['/usr/bin/ls', '-lah', '/', '/usr', '/var', '/etc', '/srv', '/home', '/dev'],
+		stdout=subprocess.DEVNULL )
 
 	# tmpfs can be written to and urandom works
 	with tempfile.NamedTemporaryFile() as tmp:
-		for n in xrange(10):
+		for n in range(10):
 			tmp.write(os.urandom(200 * 2**10))
 			tmp.flush()
 			time.sleep(0.2)
@@ -34,6 +214,18 @@ def actions():
 		os.fsync(tmp.fileno())
 		assert tmp.tell() == 0, tmp.tell()
 
+	if check_net_gw:
+		with LibMNL() as libmnl:
+			addr_gw = get_route_gw(libmnl, check_net_gw)
+			assert addr_gw, 'No gateway to ping!'
+			iface_addrs = get_iface_addrs(libmnl)
+		# Make sure gateway address is not local, even for RTA_UNICAST routes
+		addr_gw_chk = socket.inet_aton(addr_gw)
+		for addr in it.chain.from_iterable(iface_addrs.values()):
+			assert socket.inet_aton(addr) != addr_gw_chk, [addr, addr_gw]
+		# Make sure gw address is reachable
+		subprocess.check_call(['/usr/bin/fping', '-q', addr_gw])
+
 
 def main(args=None):
 	import argparse
@@ -43,7 +235,19 @@ def main(args=None):
 	parser.add_argument('-i', '--interval',
 		type=float, default=60, metavar='seconds',
 		help='Interval between running actions, in seconds (default: %(default)s).')
+	parser.add_argument('-n', '--check-net-gw',
+		nargs='?', metavar='route-dst-addr', const='8.8.8.8',
+		help='Check network gateway availability as well.'
+			' Gets gateway IPv4 address, checks it against all local IPs, pings it.'
+			' Optional dst-addr argument can be used to pick specific gateway'
+				' (and only for that, NOT for pinging)'
+				' by it (similar to "ip ro get <addr>"), default: %(default)s.'
+			' Special "-" value can be used to grab any default gateway.'
+			' Uses/requires fping binary to do the actual availability check.')
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	route_gw_addr = opts.check_net_gw
+	if route_gw_addr == '-': route_gw_addr = None
 
 	wd_interval = None
 	wd_pid, wd_usec = (os.environ.get(k) for k in ['WATCHDOG_PID', 'WATCHDOG_USEC'])
@@ -57,32 +261,33 @@ def main(args=None):
 			p_err('Invalid watchdog interval spec {!r}: {}', wd_usec, err)
 			sys.exit(1)
 	else:
-		print('Systemd watchdog seem to be disabled (wd_pid: {!r}, pid: {!r})'.format(wd_pid, pid))
+		p_err('Systemd watchdog seem to be disabled (wd_pid: {!r}, pid: {!r})', wd_pid, pid)
 
 	daemon.notify('READY=1')
 	daemon.notify(
 		'STATUS=Main loop, action/systemd-watchdog interval: {:.1f}/{}'\
 		.format(opts.interval, '{:.1f}'.format(wd_interval) if wd_interval else 'disabled') )
 
-	ts_actions = ts_wd = None
+	ts_func = time.monotonic
+	ts_actions = ts_wd = ts_func()
 	while True:
-		ts = time.time()
-
-		if ts_actions is None: ts_actions = ts + opts.interval
 		ts_delay = ts_actions
-		if ts_actions <= ts:
-			actions()
-			ts_actions = None
+		if ts_actions <= ts_func():
+			actions(check_net_gw=route_gw_addr)
+			ts_actions = ts_delay = ts_func() + opts.interval
 
 		if wd_interval:
-			if ts_wd is None: ts_wd = ts + wd_interval
-			ts_delay = min(ts_delay, ts_wd)
-			if ts_wd <= ts:
+			if ts_wd <= ts_func():
 				daemon.notify('WATCHDOG=1')
-				ts_wd = None
+				ts_wd = ts_func() + wd_interval
+			ts_delay = min(ts_delay, ts_wd)
 
-		delay = ts_delay - ts
+		delay = ts_delay - ts_func()
 		if delay > 0: time.sleep(delay)
 
 
-if __name__ == '__main__': sys.exit(main())
+if __name__ == '__main__':
+	import signal
+	for sig in 'int term'.upper().split():
+		signal.signal(getattr(signal, f'SIG{sig}'), lambda sig,frm: sys.exit(0))
+	sys.exit(main())

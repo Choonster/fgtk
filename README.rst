@@ -410,10 +410,19 @@ Jinja2 env for template has following filters and values:
   Probably a good idea to use this stuff only when IPs are static and get
   assigned strictly before templating.
 
+- ``{% comment_out_if value[, comment-prefix] %}...{% comment_out_end %}``
+
+  Custom template block to prefix each non-empty line within it with specified
+  string (defaults to "#") if value is not false-y.
+
+  Can be used when format doesn't have block comments, but it's still desirable
+  to keep disabled things in dst file (e.g. for manual tinkering) instead of
+  using if-blocks around these, or to make specific lines easier to uncomment manually.
+
 - ``it`` - itertools, ``_v``/``v_``/``_v_`` - global funcs for adding spaces
   before/after/around non-empty strings.
 
-- Whatever is loaded from ``--conf-file`` (YAML), if specified.
+- Whatever is loaded from ``--conf-file/--conf-dir`` (JSON/YAML files), if specified.
 
 Use-case is a simple conf-file pre-processor for autonomous templating on
 service startup with a minimal toolbox on top of jinja2, without huge dep-tree
@@ -1055,7 +1064,7 @@ Misc pubkey/ipv6 representation/conversion helpers.
 adhocapd
 ^^^^^^^^
 
-Picks first wireless dev from ``iw dev`` and runs hostapd + udhcpd (from
+Picks first wireless dev from ``iw dev`` and runs hostapd_ + udhcpd (from
 busybox) on it.
 
 Use-case is plugging wifi usb dongle and creating temporary AP on it - kinda
@@ -1091,7 +1100,7 @@ usb-wlan interfaces will be named according to NAME there)::
 wpa-systemd-wrapper
 ^^^^^^^^^^^^^^^^^^^
 
-Systemd wrapper for wpa_supplicant or hostapd, enabling either to work with
+Systemd wrapper for `wpa_supplicant`_ or hostapd_, enabling either to work with
 Type=notify, support WatchdogSec=, different exit codes and all that goodness.
 
 Starts the daemon as a subprocess, connecting to its management interface and
@@ -1153,9 +1162,12 @@ Python script, uses "twisted.conch" for ssh.
 kernel-patch
 ^^^^^^^^^^^^
 
-Script to update sources in /usr/src/linux to some (specified) stable
-version. Reuires "patch-X.Y.Z.xz" files (as provided on kernel.org) to be
-available under /usr/src/distfiles (configurable at the top of the script).
+Simple stateless script to update sources in /usr/src/linux to some (specified)
+stable version.
+
+Looks for "patch-X.Y.Z.xz" files (as provided on kernel.org) under
+/usr/src/distfiles (configurable at the top of the script), or downloads them
+there from kernel.org.
 
 Does update (or rollback) by grabbing current patchset version from Makefile and
 doing essentially ``patch -R < <patch-current> && patch < <patch-new>`` - i.e.
@@ -1164,14 +1176,9 @@ rolling-back the current patchset, then applying new patch.
 Always does ``patch --dry-run`` first to make sure there will be no mess left
 over by the tool and updates will be all-or-nothing.
 
-When updates get to e.g. 3.14.21 -> 3.14.22, there's a good chance such update
-will mtime-bump a lot of files (because it'll be 3.14.21 -> 3.14.0 -> 3.14.22),
-so there's "-t" option to efficiently symlink the whole sources tree, do ``patch
---follow-symlinks`` and ``rsync -c`` only actually-changed (between .21 and .22)
-stuff back.
-
 In short, allows to run e.g. ``kernel-patch 3.14.22`` to get 3.14.22 in
-``/usr/src/linux`` from any other clean 3.14.\* version there.
+``/usr/src/linux`` from any other clean 3.14.\* version, or just
+``kernel-patch`` to have the latest 3.14 patchset.
 
 kernel-conf-check
 ^^^^^^^^^^^^^^^^^
@@ -1200,10 +1207,8 @@ Trivial script to ping systemd watchdog and do some trivial actions in-between
 to make sure os still works.
 
 Wrote it after yet another silent non-crash, where linux kernel refuses to
-create new pids (with some backtraces) and seem to hang on some fs ops. In these
-cases network works, most running daemons kinda-work, while syslog/journal get
-totally jammed and backtraces (or any errors) never make it to remote logging
-sinks.
+create new pids (with some backtraces) and seem to hang on some fs ops, blocking
+syslog/journal, but leaving most simple daemons running ok-ish for a while.
 
 So this trivial script, tied into systemd-controlled watchdog timers, tries to
 create pids every once in a while, with either hang or crash bubbling-up to
@@ -1212,18 +1217,38 @@ systemd (pid-1), which should reliably reboot/crash the system via hardware wdt.
 Example watchdog.service::
 
   [Service]
-  WatchdogSec=60s
-  Restart=on-failure
-  StartLimitInterval=10min
-  StartLimitBurst=10
-  StartLimitAction=reboot-force
   Type=notify
-  ExecStart=/usr/local/bin/systemd-watchdog
+  ExecStart=/usr/local/bin/systemd-watchdog -i30 -n
+
+  WatchdogSec=60
+  TimeoutStartSec=15
+  Restart=on-failure
+  RestartSec=20
+  StartLimitInterval=10min
+  StartLimitBurst=5
+  StartLimitAction=reboot-force
 
   [Install]
   WantedBy=multi-user.target
 
-Useless without systemd and requires systemd python module.
+(be sure to tweak timeouts and test without "reboot-force" first though, be sure
+to set some RestartSec= for transient failures to not trigger StartLimitAction)
+
+Can optionally get IP of (non-local) gateway to 8.8.8.8 (or any specified IPv4)
+via libmnl (also used by iproute2, so always available) and check whether it
+responds to `fping <http://fping.org/>`_ probes, crashing if it does not - see
+-n/--check-net-gw option.
+
+That's mainly for remote systems which can become unreachable if kernel network
+stack, local firewall, dhcp, ethernet or whatever other link fails (usually due
+to some kind of local tinkering), ignoring more mundane internet failures.
+
+To avoid reboot loops (in abscence of any networking), it might be a good idea
+to only start script with this option manually (e.g. right before messing up
+with the network, or on first successful access).
+
+Useless without systemd and requires systemd python3 module, plus fping tool if
+-n/--check-net-gw option is used.
 
 bt-pan
 ^^^^^^
@@ -1317,9 +1342,9 @@ For example::
   % ssh-keyparse test-key
   HOSEWmGJtkrOBOuTGGOFXsMIsMqlnQTWAGcRIWXvRqQ=
 
-That one line at the end contains 32-byte ed25519 seed - "secret key" - all the
-necessary info to restore the blob above, without extra openssh wrapping (as per
-PROTOCOL.key).
+That one line at the end contains 32-byte ed25519 seed (with urlsafe-base64
+encoding) - "secret key" - all the necessary info to restore the blob above,
+without extra openssh wrapping (as per PROTOCOL.key).
 
 Original OpenSSH format (as produced by ssh-keygen) stores "magic string",
 ciphername ("none"), kdfname ("none"), kdfoptions (empty string), public key and
@@ -1330,8 +1355,8 @@ so take extra 4 bytes, even when empty.
 Gist is that it's a ton of stuff that's not the actual key, which ssh-keyparse
 extracts.
 
-To produce "expanded" key (seed + public key), as used in ed25519_sk field of
-openssh format, use ``ssh-keyparse --expand-seed`` option.
+To restore key from seed, use -d/--patch-key option on any existing ed25519 key,
+e.g. ``ssh-keygen -t ed25519 -N '' -f test-key && ssh-keyparse -d <seed> test-key``
 
 If key is encrypted with passphrase, ``ssh-keygen -p`` will be run on a
 temporary copy of it to decrypt, with a big warning in case it's not desirable.
@@ -1339,7 +1364,7 @@ temporary copy of it to decrypt, with a big warning in case it's not desirable.
 There's also an option (--pbkdf2) to run the thing through PBKDF2 (tunable via
 --pbkdf2-opts) and various output encodings available::
 
-  % ssh-keyparse test-key
+  % ssh-keyparse test-key  # default is urlsafe-base64 encoding
   HOSEWmGJtkrOBOuTGGOFXsMIsMqlnQTWAGcRIWXvRqQ=
 
   % ssh-keyparse test-key --hex
@@ -1542,8 +1567,16 @@ Host/port names specified on the command line are resolved synchronously on
 script startup (same as with e.g. "ping" tool), so it can't be used to wait
 until hostname resolves, only for connection itself.
 
-Uses Python-3.5+ stdlib stuff, namely asyncio, to juggle multiple connections in
-an efficient manner.
+Above example can also be shortened via -s/--ssh option, e.g.::
+
+  % tping -s myhost 1234
+  % tping -s root@myhost:1234 # same thing as above
+  % tping -s -p1234 myhost # same thing as above
+
+Will exec ``ssh -p1234 root@myhost`` immediately after successful tcp connection.
+
+Uses python3 stdlib stuff, namely asyncio, to juggle multiple connections in an
+efficient manner.
 
 bindfs-idmap
 ^^^^^^^^^^^^
@@ -1693,12 +1726,15 @@ its `loudnorm filter`_ (EBU R128 loudness normalization) in double-pass mode.
 Main purpose is to turn anything that has audio track in it into podcast for an
 audio player.
 
-Can process several source files in parallel, displays progress (from ``ffmpeg
--progress`` pipe), python3/asyncio.
+Can process several source files or URLs (either audio content-type or URL for
+youtube-dl) in parallel, displays progress (from ``ffmpeg -progress`` pipe),
+python3/asyncio.
 
 loudnorm filter and libebur128 are fairly recent additions to ffmpeg
 (3.1 release, 2016-06-27), and might not be enabled/available in distros by
 default (e.g. not enabled on Arch as of 2016-09-27).
+
+Needs youtube-dl installed if URLs are specified instead of regular files.
 
 .. _loudnorm filter: https://ffmpeg.org/ffmpeg-all.html#loudnorm
 
@@ -1828,6 +1864,26 @@ or override these via env / within a script.
 
 Requires youtube-dl_ and `jq <https://stedolan.github.io/jq/>`_ (to parse URLs
 from json).
+
+streamdump
+''''''''''
+
+Bash wrapper for streamlink_ to make dumping stream to a file more reliable,
+auto-restarting the process with new filename after any "stream ended" events or
+streamlink app exits.
+
+Example use::
+
+  % streamdump --retry-streams 60 --retry-open 99999 \
+    --twitch-disable-hosting --twitch-oauth-token ... \
+    twitch.tv/user 720p -fo dump.mp4
+
+Will create "dump.000.mp4", "dump.001.mp4" and so on for each stream restart.
+
+Intended use is for unreliable streams which go down and back up again in a
+minute or few, or working around streamlink quirks and fatal errors.
+
+.. _streamlink: https://github.com/streamlink/streamlink
 
 
 notifications
@@ -1972,11 +2028,10 @@ Use-case is simple - insert an SD card from a player and do::
 "--debug" also keeps track of what's being done and calculates how much time is
 left based on df-goal and median rate.
 
-Source dir has like `3k files`_ in many
-dirs, and cp/rsync will do the dumb "we'll copy same first things every
-time", while this tool will create the dst path for you, copy always-new
-selection there and - due to "-s 200" - leave 200 MiB there for podcasts
-you might want to also upload.
+Source dir has like `3k files`_ in many dirs, and cp/rsync will do the dumb
+"we'll copy same first things every time", while this tool will create the dst
+path for you, copy always-new selection there and - due to "-s 200" - leave 200
+MiB there for podcasts you might want to also upload.
 
 As with "cp", ``pick_tracks /path1 /path2 /dst`` is perfectly valid.
 
@@ -1989,7 +2044,8 @@ Cleanup (if requested) also picks stuff at random up to necessary df.
 "--shuffle" option allows to shuffle paths on fat by temporarily copying them
 off the media to some staging area and back in random order.
 
-Use-case is dumb mp3 players that don't have that option.
+Use-case is dumb mp3 players that don't have that option (see also vfat_shuffler
+script for these, which is way more efficient).
 
 Uses plumbum_ to call "rsync --inplace" (faster than "cp" in most cases) and
 "find" to do the actual copy/listing.
@@ -2246,11 +2302,18 @@ VM
 Scripts to start and manage qemu/kvm based VMs I use for various dev purposes.
 
 These include starting simple vde-based networking, syncing kernels and
-initramfs images out of vms, doing suspend/resume for running vms easily, etc.
+initramfs images out of vms (where needed), doing suspend/resume for running vms
+easily, etc.
 
-Probably exist just because I don't need anything but qemu/kvm and know these
-well enough, so don't really need abstractions libvirt provides, nothing really
-special.
+Don't really need abstractions libvirt (and stuff using it) provide on top of
+qemu/kvm, as latter already have decent enough interfaces to work with.
+
+Cheatsheet for qemu-img commands::
+
+  % qemu-img create -f qcow2 stuff.qcow2 10G
+  % qemu-img create -b stuff.qcow2 -f qcow2 stuff.qcow2.inc
+  % qemu-img commit stuff.qcow2.inc && rm stuff.qcow2.inc \
+    && qemu-img create -b stuff.qcow2 -f qcow2 stuff.qcow2.inc
 
 
 
@@ -2610,6 +2673,20 @@ Bash script to setup/destroy GRE tunnel with Generic UDP Encapsulation (GUE).
 
 One command instead of bunch of them, with some built-in templating to make it
 easier to use on identical remote hosts.
+
+wifi-client-match
+^^^^^^^^^^^^^^^^^
+
+Basic script to automate `wpa_supplicant`_ matching AP in a python3 script
+(e.g. by ssid regexp or any other parameters), pick best/working BSSID and
+connect to it.
+
+For cases when wpa_supplicant.conf is not powerful enough.
+
+Python3, uses dbus-python module and its glib eventloop.
+
+.. _wpa_supplicant: https://w1.fi/wpa_supplicant/
+.. _hostapd: https://w1.fi/hostapd/
 
 
 License (WTFPL)
