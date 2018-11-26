@@ -25,7 +25,7 @@ async def conn_discard(conn):
 	conn.cancel()
 	with contextlib.suppress(asyncio.CancelledError, socket.error): await conn
 
-async def run_tping(loop, *args, **kws):
+async def run_tping(loop, timeout, *args, **kws):
 	conns, exit_code = OrderedDict(), 0
 	pinger = loop.create_task(_run_tping(loop, conns, *args, **kws))
 	def sig_handler(code):
@@ -34,11 +34,15 @@ async def run_tping(loop, *args, **kws):
 		pinger.cancel()
 	for sig, code in ('SIGINT', 1), ('SIGTERM', 0):
 		loop.add_signal_handler(getattr(signal, sig), ft.partial(sig_handler, code))
-	with contextlib.suppress(asyncio.CancelledError): await pinger
+	with contextlib.suppress(asyncio.CancelledError):
+		task = pinger
+		if timeout: task = asyncio.wait_for(pinger, timeout)
+		try: await task
+		except asyncio.TimeoutError: exit_code = exit_code_timeout
 	for conn in conns.values(): await conn_discard(conn)
 	return exit_code
 
-async def _run_tping(loop, conns, sock_addr, sock_af, delay_retry, timeout):
+async def _run_tping(loop, conns, sock_addr, sock_af, delay_retry, conn_timeout):
 	ts_retry = loop.time() + delay_retry
 	while True:
 		ts = loop.time()
@@ -46,7 +50,7 @@ async def _run_tping(loop, conns, sock_addr, sock_af, delay_retry, timeout):
 			*sock_addr[:2], family=sock_af, proto=socket.IPPROTO_TCP ))
 		t.ts_conn = ts
 
-		ts_abort = ts - timeout
+		ts_abort = ts - conn_timeout
 		for ts_conn in list(conns):
 			if ts_conn <= ts_abort:
 				await conn_discard(conns[ts_conn])
@@ -88,18 +92,19 @@ def sockopt_resolve(prefix, v):
 	return v
 
 port_default = 22
+exit_code_timeout = 173
 
 def main(args=None):
 	import argparse
 	parser = argparse.ArgumentParser(
 		description='Tool to "ping" tcp port until connection can be established.'
 			' Main use is waiting for something to come online,'
-				' e.g. waiting for when ssh port is accessible after remote host reboots.'
+				' e.g. for when ssh port is accessible after remote host reboots.'
 			' Unlike common icmp ping tools, does not need elevated privileges.')
 
 	group = parser.add_argument_group('Destination spec')
 	group.add_argument('host',
-		help='Host/address (to be resolve via gai) or [user@]host[:port] spec.'
+		help='Host/address (to be resolved via gai) or [user@]host[:port] spec.'
 			' User part can be specified for -s/--ssh option and is ignored otherwise.')
 	group.add_argument('port_arg', nargs='?',
 		help='TCP service/port name/number to connect to.'
@@ -117,8 +122,12 @@ def main(args=None):
 			' Does not take any other started connections/handshakes into account.'
 			' Default: %(default)ss')
 	group.add_argument('-t', '--timeout',
+		type=float, metavar='seconds',
+		help='Timeout on waiting for specified port to become accessible.'
+			f' Script exits with code {exit_code_timeout} when this is reached.')
+	group.add_argument('--conn-timeout',
 		type=float, metavar='seconds', default=3.0,
-		help='Delay after which to consider establishing'
+		help='Delay after which to consider establishing each individual'
 			' connection as timed-out and cancel it. Default: %(default)ss')
 
 	group = parser.add_argument_group('Extra actions')
@@ -128,6 +137,8 @@ def main(args=None):
 	group.add_argument('-o', '--ssh-opts', action='append',
 		help='Extra options for ssh command, if -s/--ssh flag is used.'
 			' Will be split on spaces, unless option is used multiple times.'
+			' If has no spaces and does not start with a dash, single dash is prepended,'
+				" e.g. -o=NnT -> -o=-NnT, purely for convenience with few short options."
 			' Can contain special "@@@" token (as a separate arg) to'
 				' substitute user@host in its place, otherwise it will be appended.'
 			" Example: -o='-NnT -i mykey @@@ -- cat /etc/hosts'")
@@ -153,22 +164,25 @@ def main(args=None):
 	else: port = port_default
 
 	ssh_opts = opts.ssh_opts or list()
-	if len(ssh_opts) == 1: ssh_opts = ssh_opts[0].strip().split()
+	if len(ssh_opts) == 1:
+		ssh_opts = ssh_opts[0].strip().split()
+		if len(ssh_opts) == 1 and not ssh_opts[0].startswith('-'): ssh_opts[0] = f'-{ssh_opts[0]}'
 
 	try:
 		addrinfo = socket.getaddrinfo(
 			host, str(port), type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP )
 		if not addrinfo: raise socket.gaierror('No addrinfo for host: {}'.format(host))
 	except (socket.gaierror, socket.error) as err:
-		parser.error( 'Failed to resolve socket parameters (address, family)'
-			' via getaddrinfo: {!r} - [{}] {}'.format((host, port), err.__class__.__name__, err) )
+		print( 'ERROR: getaddrinfo failure for {!r} - [{}] {}'\
+			.format((host, port), err.__class__.__name__, err), file=sys.stderr )
+		return 1
 	sock_af, sock_t, _, _, sock_addr = addrinfo[0]
 	log.debug( 'Resolved host:port {!r}:{!r} to endpoint: {} (family: {}, type: {})',
 		host, port, sock_addr, sockopt_resolve('af_', sock_af), sockopt_resolve('sock_', sock_t) )
 
 	with contextlib.closing(asyncio.get_event_loop()) as loop:
 		err = loop.run_until_complete(run_tping(
-			loop, sock_addr, sock_af, opts.retry_delay, opts.timeout ))
+			loop, opts.timeout, sock_addr, sock_af, opts.retry_delay, opts.conn_timeout ))
 	if err: return err
 
 	if opts.ssh:

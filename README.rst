@@ -66,26 +66,6 @@ pyacl
 Tool to restore POSIX ACLs on paths, broken by chmod or similar stuff without
 actually changing them.
 
-rsync-diff
-''''''''''
-
-Tool to sync paths, based on berkley db and rsync.
-
-Keeps b-tree of paths (files and dirs) and corresponding mtimes in berkdb,
-comparing state when ran and building a simple merge-filter for rsync (``+
-/path`` line for each changed file/dir, including their path components, ending
-with ``- *``). Then it runs a single rsync with this filter to efficiently sync
-the paths.
-
-Note that the only difference from "rsync -a src dst" here is that "dst" tree
-doesn't have to exist on fs, otherwise scanning "dst" should be pretty much the
-same (and probably more efficient, depending on fs implementation) b-tree
-traversal as with berkdb.
-
-Wrote it before realizing that it's quite pointless for my mirroring use-case -
-I do have full source and destination trees, so rsync can be used to compare (if
-diff file-list is needed) or sync them.
-
 fs
 ''
 
@@ -126,6 +106,38 @@ Example - run "make" on any change to ``~user/hatch/project`` files::
 
 .. _fatrace: https://launchpad.net/fatrace
 .. _fanotify: http://lwn.net/Articles/339253/
+
+audit-follow
+''''''''''''
+
+Trivial py3 script to decode audit messages from "journalctl -af" output,
+i.e. stuff like this::
+
+  Jul 24 17:14:01 malediction audit: PROCTITLE
+    proctitle=7368002D630067726570202D652044... (loooong hex-encoded string)
+
+Into this::
+
+  [1327] proctitle='sh -c grep -e Dirty: -e Writeback: /proc/meminfo'
+
+Filters for audit messages only, strips long audit-id/time prefixes,
+unless -a/--all specified, puts separators between multi-line audit reports,
+relative and/or differential timestamps (-r/--reltime and -d/--difftime opts).
+
+Audit subsystem can be very useful to understand which process modifies some
+path or what's the command-line of /bin/bash being occasionally run without need
+for strace or where it's inapplicable.
+
+Some useful auditctl incantations (cheatsheet)::
+
+  # auditctl -e 1
+  # auditctl -a exit,always -S execve -F path=/bin/bash
+  # auditctl -a exit,always -F auid=1001 -S open -S openat
+  # auditctl -w /some/important/path/ -p rwxa
+  # auditctl -e 0
+  # auditctl -D
+
+auditd + ausearch can be used as an offline/advanced alternative to such script.
 
 clean-boot
 ''''''''''
@@ -303,6 +315,28 @@ Unlike tool from coreutils, can overwrite files with sorted results
 for splitting fields and sorting by one of these (example: ``pysort -d: -f2 -n
 /etc/passwd``).
 
+repr
+''''
+
+Ever needed to check if file has newlines or BOM in it, yet every editor is
+user-friendly by default and hides these from actual file contents?
+
+One fix is hexdump or switching to binary mode, but these are usually terrible
+for looking at text, and tend to display all non-ASCII as "." instead of nicer
+\\r \\t \\n ... escapes, not to mention unicode chars.
+
+This trivial script prints each line in a file via python3's repr(), which is
+usually very nice, has none of the above issues and doesn't dump byte codes on
+you for anything it can interpret as char/codepoint or some neat escape code.
+
+Has opts for text/byte mode and stripping "universal newlines" (see newline= in
+built-in open() func).
+
+Can also do encoding/newline conversion via -c option, as iconv can't do BOM or
+newlines, and sometimes you just want "MS utf-8 mode" (``repr -c utf-8-sig+r``).
+Using that with +i flag as e.g. ``repr -c utf-8-sig+ri file1 file2 ...``
+converts encoding+newlines+BOM for files in-place at no extra hassle.
+
 color
 '''''
 
@@ -314,6 +348,8 @@ terminal::
   % t -f /var/log/app1.log | color red - &
   % t -f /var/log/app2.log | color green - &
   % t -f /var/log/app2.log | color blue - &
+
+Or to get color-escape-magic for your bash script: ``color red bold p``
 
 resolve-hostnames
 '''''''''''''''''
@@ -565,241 +601,24 @@ new key generation in cryptsetup or such).
 
 
 
-dev
-~~~
-
-tabs_filter
-^^^^^^^^^^^
-
-My secret weapon in tabs-vs-spaces holywar.
-
-In my emacs, tab key always inserts "", marking spaces as a bug with
-develock-mode. This script transparently converts all indent-tabs into spaces
-and back, designed to be used from git content filters, and occasionally by
-hand.
-
-.git/config::
-
-  [filter "tabs"]
-    clean = tabs_filter clean %f
-    smudge = tabs_filter smudge %f
-
-.git/info/attributes or .gitattributes::
-
-  *.py filter=tabs
-  *.tac filter=tabs
-
-Not sure why people have such strong opinions on that trivial matter,
-but I find it easier never to mention that I use such script ;)
-
-golang_filter
-^^^^^^^^^^^^^
-
-Same idea as in "tabs_filter", but on a larger scale - basically does to Go_
-what coffee-script_ does to the syntax of javascript - drops all the unnecessary
-brace-cancer, with the ability to restore original perfectly ("diff -u reverse
-original" is checked upon transformation to make sure of that), as long as code
-intentation is correct.
-
-.. _Go: http://golang.org/
-.. _coffee-script: http://jashkenas.github.com/coffee-script/
-
-.git/config::
-
-  [filter "golang"]
-    clean = golang_filter git-clean %f
-    smudge = golang_filter git-smudge %f
-
-.git/info/attributes or .gitattributes::
-
-  *.go filter=golang
-
-Again, ideally no one should even notice that I actually don't have that crap in
-the editor, while repo and compiler will see the proper (bloated) code.
-
-distribute_regen
-^^^^^^^^^^^^^^^^
-
-Tool to auto-update python package metadata in setup.py and README files.
-
-Uses python ast module to parse setup.py to find "version" keyword there and
-update it (via simple regex replacement, not sure if ast can be converted back
-to code properly), based on date and current git revision number, producing
-something like "12.04.58" (year.month.revision-since-month-start).
-
-Also generates (and checks with docutils afterwards) README.txt (ReST) from
-README.md (Markdown) with pandoc, if both are present and there's no README or
-README.rst.
-
-Designed to be used from pre-commit hook, like ``ln -s /path/to/distribute_regen
-.git/hooks/pre-commit``, to update version number before every commit.
-
-darcs_bundle_to_diff
-^^^^^^^^^^^^^^^^^^^^
-
-Ad-hoc tool to dissect and convert darcs bundles into a sequence of unified diff
-hunks. Handles file creations and all sorts of updates, but probably not moves
-and removals, which were outside my use-case at the moment.
-
-Was written for just one occasion (re-working old bundles attached to tahoe-lafs
-tickets, which crashed darcs on "darcs apply"), so might be incomplete and a bit
-out-of-date, but I imagine it shouldn't take much effort to make it work with
-any other bundles.
-
-git-nym
-^^^^^^^
-
-Script to read NYM env var and run git using that ssh id instead of whatever
-ssh-agent or e.g. ``~/.ssh/id_rsa`` provides.
-
-NYM var is checked for either full path to the key, basename in ``~/.ssh``, name
-like ``~/.ssh/id_{rsa,ecdsa,ed25519}__${NYM}`` or unique (i.e. two matches will
-cause error, not random pick) match for one of ``~/.ssh/id_*`` name part.
-
-Can be used as ``NYM=project-x git-nym clone git@dev.project-x:component-y`` to
-e.g.  clone the specified repo using ``~/.ssh/id_rsa__project-x`` key or as
-``NYM=project-x git nym clone ...``.
-
-Also to just test new keys with git, disregarding ssh-agent and lingering
-control sockets with NYM_CLEAN flag set.
-
-git-meld
-^^^^^^^^
-
-Git-command replacement for git-diff to run meld instead of regular
-(git-provided) textual diff, but aggregating all the files into one invocation.
-
-For instance, if diffs are in ``server.py`` and ``client.py`` files, running
-``git meld`` will run something like::
-
-  meld \
-    --diff /tmp/.git-meld/server.py.hash1 /tmp/.git-meld/server.py.hash2 \
-    --diff /tmp/.git-meld/client.py.hash1 /tmp/.git-meld/client.py.hash2
-
-Point is to have all these diffs in meld tabs (with one window per ``git meld``)
-instead of running separate meld window/tab on each pair of files as setting
-GIT_EXTERNAL_DIFF would do.
-
-Should be installed as ``git-meld`` somewhere in PATH *and* symlinked as
-``meld-git`` (git-meld runs ``GIT_EXTERNAL_DIFF=meld-git git diff "$@"``) to
-work.
-
-catn
-^^^^
-
-Similar to "cat" (specifically coreutils' ``cat -n file``), but shows specific
-line in a file with a few "context" lines around it::
-
-  % catn js/main.js 188
-     185:     projectionTween = function(projection0, projection1) {
-     186:       return function(d) {
-     187:         var project, projection, t;
-  >> 188:         project = function(λ, φ) {
-     189:           var p0, p1, _ref1;
-     190:           λ *= 180 / Math.PI;
-     191:           φ *= 180 / Math.PI;
-
-Above command is synonymous to ``catn js/main.js 188 3``, ``catn
-js/main.js:188`` and ``catn js/main.js:188:3``, where "3" means "3 lines of
-context" (can be omitted as 3 is the default value there).
-
-``catn -q ...`` outputs line + context verbatim, so it'd be more useful for
-piping to another file/command or terminal copy-paste.
-
-git_terminate
-^^^^^^^^^^^^^
-
-Script to permanently delete files/folders from repository and its history -
-including "dangling" objects where these might still exist.
-
-Should be used from repo root with a list of paths to delete, e.g.
-``git_terminate path1 path2``.
-
-WARNING: will do things like ``git reflog expire`` and ``git gc`` with agressive
-parameters on the whole repository, so any other possible history not stashed or
-linked to existing branches/remotes (e.g. stuff in ``git reflog``) will be
-purged.
-
-git_contains
-^^^^^^^^^^^^
-
-Checks if passed tree-ish (hash, trimmed hash, branch name, etc - see
-"SPECIFYING REVISIONS" in git-rev-parse(1)) object(s) exist (e.g.  merged) in a
-specified git repo/tree-ish.
-
-Essentially does ``git rev-list <tree-ish2> | grep $(git rev-parse
-<tree-ish1>)``.
-
-::
-
-  % git_contains -C /var/src/linux-git ee0073a1e7b0ec172
-  [exit status=0, hash was found]
-
-  % git_contains -C /var/src/linux-git ee0073a1e7b0ec172 HEAD notarealthing
-  Missing:
-    notarealthing
-  [status=2 right when rev-parse fails before even starting rev-list]
-
-  % git_contains -C /var/src/linux-git -H v3.5 --quiet ee0073a1e7b0ec172
-  [status=2, this commit is in HEAD, but not in v3.5 (tag), --quiet doesn't produce stdout]
-
-  % git_contains -C /var/src/linux-git --any ee0073a1e7b0ec172 notarealthing
-  [status=0, ee0073a1e7b0ec172 was found, and it's enough with --any]
-
-  % git_contains -C /var/src/linux-git --strict notarealthing
-  fatal: ambiguous argument 'notarealting': unknown revision or path not in the working tree.
-  Use '--' to separate paths from revisions, like this:
-  'git <command> [<revision>...] -- [<file>...]'
-  git rev-parse failed for tree-ish 'notarealting' (command: ['git', 'rev-parse', 'notarealting'])
-
-Lines in square brackets above are comments, not actual output.
-
-gtk-val-slider
-^^^^^^^^^^^^^^
-
-Renders gtk3 window with a slider widget and writes value (float or int) picked
-there either to stdout or to a specified file, with some rate-limiting delay.
-
-Useful to mock/control values on a dev machine.
-
-E.g. instead of hardware sensors (which might be hard to get/connect/use), just
-setup app to read value(s) that should be there from file(s), specify proper
-value range to the thing and play around with values all you want to see what
-happens.
-
-
-
 Misc
 ~~~~
 
 systemd-dashboard
 ^^^^^^^^^^^^^^^^^
 
-There's a `Dashboard-for-... blog post`_ with more details.
+Python3 script to list all currently active and non-transient systemd units,
+so that these can be tracked as a "system state",
+and e.g. any deviations there detected/reported (simple diff can do it).
 
-::
+Gets unit info by parsing Dump() snapshot fetched via sd-bus API of libsystemd
+(using ctypes to wrap it), which is same as e.g. "systemd-analyze dump" gets.
 
-  root@damnation:~# systemd-dashboard -h
-  usage: systemd-dashboard [-h] [-s] [-u] [-n] [-x]
+Has -m/--machines option to query state from all registered machines as well,
+which requires root (for sd_bus_open_system_machine) due to current systemd limitations.
 
-  Tool to compare the set of enabled systemd services against currently running
-  ones. If started without parameters, it'll just show all the enabled services
-  that should be running (Type != oneshot) yet for some reason they aren't.
-
-  optional arguments:
-    -h, --help            show this help message and exit
-    -s, --status          Show status report on found services.
-    -u, --unknown         Show enabled but unknown (not loaded) services.
-    -n, --not-enabled     Show list of services that are running but are not
-                          enabled directly.
-    -x, --systemd-internals
-                          Dont exclude systemd internal services from the
-                          output.
-
-  root@damnation:~# systemd-dashboard
-  smartd.service
-  systemd-readahead-replay.service
-  apache.service
+See `Dashboard-for-... blog post`_ for extended rationale,
+though it's probably obsolete otherwise since this thing was rewritten.
 
 .. _Dashboard-for-... blog post: http://blog.fraggod.net/2011/2/Dashboard-for-enabled-services-in-systemd
 
@@ -808,8 +627,8 @@ at
 
 Replacement for standard unix'ish "atd" daemon in the form of a bash script.
 
-It just forks out and waits for however long it needs before executing the given
-command. Unlike with atd, such tasks won't survive reboot, obviously.
+| It just forks out and waits for however long it needs before executing the given command.
+| Unlike atd proper, such tasks won't survive reboot, obviously.
 
 ::
 
@@ -833,8 +652,24 @@ be weak if bruteforce attack picks words instead of individual lettters.
 ssh-tunnel
 ^^^^^^^^^^
 
-Script to keep persistent, unique and reasonably responsive ssh tunnel.  Mostly
-just a wrapper with collection of options for such use-case.
+| Script to keep persistent, unique and reasonably responsive ssh tunnels.
+| Mostly just a bash wrapper with collection of options for such use-case.
+|
+
+I.e. to run ``ssh-tunnel -ti 60 2223:nexthop:22 user@host -p2222`` instead of
+some manual loop (re-)connecting every 60s in the background using something like::
+
+  ssh \
+    -oControlPath=none -oControlMaster=no \
+    -oConnectTimeout=5 -oServerAliveInterval=3 -oServerAliveCountMax=5 \
+    -oPasswordAuthentication=no -oNumberOfPasswordPrompts=0 \
+    -oBatchMode=yes -oExitOnForwardFailure=yes -TnNqy \
+    -p2222 -L 2223:nexthop:22 user@host
+
+Which are all pretty much required for proper background tunnel operation.
+
+| Has opts for reverse-tunnels and using tping tool instead of ssh/sleep loop.
+| Keeps pidfiles in /tmp and allows to kill running tunnel-script via same command with -k/kill appended.
 
 ssh-reverse-mux-\*
 ^^^^^^^^^^^^^^^^^^
@@ -1145,19 +980,20 @@ opts for more info.
 mikrotik-backup
 ^^^^^^^^^^^^^^^
 
-Script to ssh into `mikrotik router <http://mikrotik.com>`__ with specified
-("--auth-file" option) user/password and get the backup, optionally compressing
-it.
+Script to ssh into `mikrotik <http://mikrotik.com>`_ routers with really old
+DSA-only firmware via specified ("--auth-file" option) user/password and get the
+backup, optionally compressing it.
 
-Can determine address of the router on its own (using "ip route get").
+| Can determine address of the router on its own (using "ip route get").
+| Can be used more generally to get/store output of any command(s) to the router.
+| Python script, uses "twisted.conch" for ssh.
+|
 
-Can be used more generally to get/store output of any command(s) to the router.
+Should not be used with modern firmware, where using e.g. ``ssh admin@router
+/export`` with RSA keys works perfectly well.
 
-RouterOS allows using DSA (old, disabled on any modern sshds) keys, which should
-be used if accessible at the standard places (e.g.  "~/.ssh/id_dsa"). That might
-be preferrable to using password auth.
-
-Python script, uses "twisted.conch" for ssh.
+"backup/ssh-dump" script from this repo can be used to pass all necessary
+non-interactive mode options and compress/rotate resulting file with these.
 
 kernel-patch
 ^^^^^^^^^^^^
@@ -1218,7 +1054,9 @@ Example watchdog.service::
 
   [Service]
   Type=notify
-  ExecStart=/usr/local/bin/systemd-watchdog -i30 -n
+  ExecStart=/usr/local/bin/systemd-watchdog -i30 -n \
+    -f /var/log/wdt-fail.log \
+    -x 'ip link' -x 'ip addr' -x 'ip ro' -x 'journalctl -an30'
 
   WatchdogSec=60
   TimeoutStartSec=15
@@ -1231,10 +1069,10 @@ Example watchdog.service::
   [Install]
   WantedBy=multi-user.target
 
-(be sure to tweak timeouts and test without "reboot-force" first though, be sure
-to set some RestartSec= for transient failures to not trigger StartLimitAction)
+(be sure to tweak timeouts and test without "reboot-force" first though,
+e.g. pick RestartSec= for transient failures to not trigger StartLimitAction)
 
-Can optionally get IP of (non-local) gateway to 8.8.8.8 (or any specified IPv4)
+Can optionally get IP of (non-local) gateway to 1.1.1.1 (or any specified IPv4)
 via libmnl (also used by iproute2, so always available) and check whether it
 responds to `fping <http://fping.org/>`_ probes, crashing if it does not - see
 -n/--check-net-gw option.
@@ -1246,6 +1084,11 @@ to some kind of local tinkering), ignoring more mundane internet failures.
 To avoid reboot loops (in abscence of any networking), it might be a good idea
 to only start script with this option manually (e.g. right before messing up
 with the network, or on first successful access).
+
+-f/--fail-log option is to log date/time of any failures for latest boot
+and run -x/--fail-log-cmd command(s) on any python exceptions (note: kernel
+hangs probably won't cause these), logging their stdout/stderr there -
+e.g. to dump network configuration info as in example above.
 
 Useless without systemd and requires systemd python3 module, plus fping tool if
 -n/--check-net-gw option is used.
@@ -1512,7 +1355,8 @@ some command there.
 
 My use-case is to emulate proper "login" session for systemd-logind, which
 neither "su" nor "sudo" can do (nor should do!) in default pam configurations
-for them, as they don't (and shouldn't) load pam_systemd.so.
+for them, as they don't load pam_systemd.so (as opposed to something like
+``machinectl shell myuser@ -- ...``).
 
 This script can load any pam stack however, so e.g. running it as::
 
@@ -1527,15 +1371,11 @@ logind with the session).
 Can be used as a GDM-less way to start/keep such sessions (with proper
 display/tty and class/type from env) without much hassle or other weirdness like
 "agetty --autologin" or "login" in some pty (see also `mk-fg/de-setup
-<https://github.com/mk-fg/de-setup>`_ repo), or for whatever other pam-session
-wrapping, as script has nothing specific (or even related) to desktops.
+<https://github.com/mk-fg/de-setup>`_ repo), or for whatever other pam wrapping
+or testing (e.g. try logins with passwords from file), as it has nothing
+specific (or even related) to desktops.
 
 Self-contained python-3 script, using libpam via ctypes.
-
-``machinectl shell myuser@ some-command`` seem to do very similar if not same
-exact thing, so maybe a good idea to use that instead, if possible.
-Didn't think it'd work for root container like that at the time of writing this
-script.
 
 Warning: this script is no replacement for su/sudo wrt uid/gid-switching, and
 doesn't implement all the checks and sanitization these tools do, so only
@@ -1614,6 +1454,387 @@ Should be safe to use anywhere, as in most non-nspawn cases upper bits of
 uid/gid are always zero, hence any changes can be easily reverted by running
 this tool again with -c0.
 
+primes
+^^^^^^
+
+Python3 script to print prime numbers in specified range.
+
+For small ranges only, as it does brute-force [2, sqrt(n)] division checks,
+and intended to generate primes for non-overlapping "tick % n" workload spacing,
+not any kind of crypto operations.
+
+boot-patcher
+^^^^^^^^^^^^
+
+Py3 script to run on early boot, checking specific directory for update-files
+and unpack/run these, recording names to skip applied ones on subsequent boots.
+
+Idea for it is to be very simple, straightforward, single-file drop-in script to
+put on distributed .img files to avoid re-making these on every one-liner change,
+sending tiny .update files instead.
+
+Update-file format:
+
+- Either zip or bash script with .update suffix.
+- Script/zip detected by python's zipfile.is_zipfile() (zip file magic).
+- If zip, should contain "_install" (update-install) script inside.
+- Update-install script shebang is optional, defaults to "#!/bin/bash".
+
+Update-install script env:
+
+- BP_UPDATE_ID: name of the update (without .update suffix, e.g. "001.test").
+
+- BP_UPDATE_DIR: unpacked update zip dir in tmpfs.
+
+  Will only have "_install" file in it for standalone scripts (non-zip).
+
+- BP_UPDATE_STATE: /var/lib/boot-patcher/<update-id>
+
+  Persistent dir created for this update, can be used to backup various
+  updated/removed files, just in case.
+
+  If left empty, removed after update-install script is done.
+
+- BP_UPDATE_STATE_ROOT: /var/lib/boot-patcher
+
+- BP_UPDATE_REBOOT: reboot-after flag-file (on tmpfs) to touch.
+
+  | If reboot is required after this update, create (touch) file at that path.
+  | Reboot will be done immediately after this particular update, not after all of them.
+
+- BP_UPDATE_REAPPLY: flag-file (on tmpfs) to re-run this update on next boot.
+
+  Can be used to retry failed updates by e.g. creating it at the start of the
+  script and removing on success.
+
+Example update-file contents:
+
+- 2017-10-27.001.install-stuff.zip.update
+
+  ``_install``::
+
+    cd "$BP_UPDATE_DIR"
+    exec pacman --noconfirm -U *.pkg.tar.xz
+
+  ``*.pkg.tar.xz`` - any packages to install, zipped alongside that ^^^
+
+- 2017-10-28.001.disable-console-logging.update (single update-install file)::
+
+    patch -l /boot/boot.ini <<'EOF'
+    --- /boot/boot.ini.old  2017-10-28 04:11:15.836588509 +0000
+    +++ /boot/boot.ini      2017-10-28 04:11:38.000000000 +0000
+    @@ -6,7 +6,7 @@
+     hdmitx edid
+
+     setenv condev "console=ttyAML0,115200n8 console=tty0"
+    -setenv bootargs "root=/dev/mmcblk1p2 ... video=HDMI-A-1:1920x1080@60e"
+    +setenv bootargs "root=/dev/mmcblk1p2 ... video=HDMI-A-1:1920x1080@60e loglevel=1"
+
+     setenv loadaddr "0x1080000"
+     setenv dtb_loadaddr "0x1000000"
+    EOF
+    touch "$BP_UPDATE_REBOOT"
+
+- 2017-10-28.002.apply-patches-from-git.zip.update
+
+  ``_install``::
+
+    set -e -o pipefail
+    cd /srv/app
+    for p in "$BP_UPDATE_DIR"/*.patch ; do patch -p1 -i "$p"; done
+
+  ``*.patch`` - patches for "app" from the repo, made by e.g. ``git format-patch -3``.
+
+Misc notes:
+
+- Update-install exit code is not checked.
+
+- After update-install is finished, and if BP_UPDATE_REAPPLY was not created,
+  "<update-id>.done" file is created in BP_UPDATE_STATE_ROOT and update is
+  skipped on all subsequent runs.
+
+- Update ordering is simple alphasort, dependenciess can be checked by update
+  scripts via .done files (also mentioned in prev item).
+
+- No auth (e.g. signature checks) for update-files, so be sure to send these
+  over secure channels.
+
+- Run as ``boot-patcher --print-systemd-unit`` for the only bit of setup it needs.
+
+
+
+dev
+~~~
+
+Minor things I tend to use when writing code and stuff.
+
+tabs_filter
+^^^^^^^^^^^
+
+My secret weapon in tabs-vs-spaces holywar.
+
+In my emacs, tab key always inserts "", marking spaces as a bug with
+develock-mode. This script transparently converts all indent-tabs into spaces
+and back, designed to be used from git content filters, and occasionally by
+hand.
+
+.git/config::
+
+  [filter "tabs"]
+    clean = tabs_filter clean %f
+    smudge = tabs_filter smudge %f
+
+.git/info/attributes or .gitattributes::
+
+  *.py filter=tabs
+  *.tac filter=tabs
+
+Not sure why people have such strong opinions on that trivial matter,
+but I find it easier never to mention that I use such script ;)
+
+golang_filter
+^^^^^^^^^^^^^
+
+Same idea as in "tabs_filter", but on a larger scale - basically does to Go_
+what coffee-script_ does to the syntax of javascript - drops all the unnecessary
+brace-cancer, with the ability to restore original perfectly ("diff -u reverse
+original" is checked upon transformation to make sure of that), as long as code
+intentation is correct.
+
+.. _Go: http://golang.org/
+.. _coffee-script: http://jashkenas.github.com/coffee-script/
+
+.git/config::
+
+  [filter "golang"]
+    clean = golang_filter git-clean %f
+    smudge = golang_filter git-smudge %f
+
+.git/info/attributes or .gitattributes::
+
+  *.go filter=golang
+
+Again, ideally no one should even notice that I actually don't have that crap in
+the editor, while repo and compiler will see the proper (bloated) code.
+
+distribute_regen
+^^^^^^^^^^^^^^^^
+
+Tool to auto-update python package metadata in setup.py and README files.
+
+Uses python ast module to parse setup.py to find "version" keyword there and
+update it (via simple regex replacement, not sure if ast can be converted back
+to code properly), based on date and current git revision number, producing
+something like "12.04.58" (year.month.revision-since-month-start).
+
+Also generates (and checks with docutils afterwards) README.txt (ReST) from
+README.md (Markdown) with pandoc, if both are present and there's no README or
+README.rst.
+
+Designed to be used from pre-commit hook, like ``ln -s /path/to/distribute_regen
+.git/hooks/pre-commit``, to update version number before every commit.
+
+darcs_bundle_to_diff
+^^^^^^^^^^^^^^^^^^^^
+
+Ad-hoc tool to dissect and convert darcs bundles into a sequence of unified diff
+hunks. Handles file creations and all sorts of updates, but probably not moves
+and removals, which were outside my use-case at the moment.
+
+Was written for just one occasion (re-working old bundles attached to tahoe-lafs
+tickets, which crashed darcs on "darcs apply"), so might be incomplete and a bit
+out-of-date, but I imagine it shouldn't take much effort to make it work with
+any other bundles.
+
+git-nym
+^^^^^^^
+
+Script to read NYM env var and run git using that ssh id instead of whatever
+ssh-agent or e.g. ``~/.ssh/id_rsa`` provides.
+
+NYM var is checked for either full path to the key, basename in ``~/.ssh``, name
+like ``~/.ssh/id_{rsa,ecdsa,ed25519}__${NYM}`` or unique (i.e. two matches will
+cause error, not random pick) match for one of ``~/.ssh/id_*`` name part.
+
+Can be used as ``NYM=project-x git-nym clone git@dev.project-x:component-y`` to
+e.g.  clone the specified repo using ``~/.ssh/id_rsa__project-x`` key or as
+``NYM=project-x git nym clone ...``.
+
+Also to just test new keys with git, disregarding ssh-agent and lingering
+control sockets with NYM_CLEAN flag set.
+
+git-meld
+^^^^^^^^
+
+Git-command replacement for git-diff to run meld instead of regular
+(git-provided) textual diff, but aggregating all the files into one invocation.
+
+For instance, if diffs are in ``server.py`` and ``client.py`` files, running
+``git meld`` will run something like::
+
+  meld \
+    --diff /tmp/.git-meld/server.py.hash1 /tmp/.git-meld/server.py.hash2 \
+    --diff /tmp/.git-meld/client.py.hash1 /tmp/.git-meld/client.py.hash2
+
+Point is to have all these diffs in meld tabs (with one window per ``git meld``)
+instead of running separate meld window/tab on each pair of files as setting
+GIT_EXTERNAL_DIFF would do.
+
+Should be installed as ``git-meld`` somewhere in PATH *and* symlinked as
+``meld-git`` (git-meld runs ``GIT_EXTERNAL_DIFF=meld-git git diff "$@"``) to
+work.
+
+catn
+^^^^
+
+Similar to "cat" (specifically coreutils' ``cat -n file``), but shows specific
+line in a file with a few "context" lines around it::
+
+  % catn js/main.js 188
+     185:     projectionTween = function(projection0, projection1) {
+     186:       return function(d) {
+     187:         var project, projection, t;
+  >> 188:         project = function(λ, φ) {
+     189:           var p0, p1, _ref1;
+     190:           λ *= 180 / Math.PI;
+     191:           φ *= 180 / Math.PI;
+
+Above command is synonymous to ``catn js/main.js 188 3``, ``catn
+js/main.js:188`` and ``catn js/main.js:188:3``, where "3" means "3 lines of
+context" (can be omitted as 3 is the default value there).
+
+``catn -q ...`` outputs line + context verbatim, so it'd be more useful for
+piping to another file/command or terminal copy-paste.
+
+git_terminate
+^^^^^^^^^^^^^
+
+Script to permanently delete files/folders from repository and its history -
+including "dangling" objects where these might still exist.
+
+Should be used from repo root with a list of paths to delete, e.g.
+``git_terminate path1 path2``.
+
+WARNING: will do things like ``git reflog expire`` and ``git gc`` with agressive
+parameters on the whole repository, so any other possible history not stashed or
+linked to existing branches/remotes (e.g. stuff in ``git reflog``) will be
+purged.
+
+git_contains
+^^^^^^^^^^^^
+
+Checks if passed tree-ish (hash, trimmed hash, branch name, etc - see
+"SPECIFYING REVISIONS" in git-rev-parse(1)) object(s) exist (e.g.  merged) in a
+specified git repo/tree-ish.
+
+Essentially does ``git rev-list <tree-ish2> | grep $(git rev-parse
+<tree-ish1>)``.
+
+::
+
+  % git_contains -C /var/src/linux-git ee0073a1e7b0ec172
+  [exit status=0, hash was found]
+
+  % git_contains -C /var/src/linux-git ee0073a1e7b0ec172 HEAD notarealthing
+  Missing:
+    notarealthing
+  [status=2 right when rev-parse fails before even starting rev-list]
+
+  % git_contains -C /var/src/linux-git -H v3.5 --quiet ee0073a1e7b0ec172
+  [status=2, this commit is in HEAD, but not in v3.5 (tag), --quiet doesn't produce stdout]
+
+  % git_contains -C /var/src/linux-git --any ee0073a1e7b0ec172 notarealthing
+  [status=0, ee0073a1e7b0ec172 was found, and it's enough with --any]
+
+  % git_contains -C /var/src/linux-git --strict notarealthing
+  fatal: ambiguous argument 'notarealting': unknown revision or path not in the working tree.
+  Use '--' to separate paths from revisions, like this:
+  'git <command> [<revision>...] -- [<file>...]'
+  git rev-parse failed for tree-ish 'notarealting' (command: ['git', 'rev-parse', 'notarealting'])
+
+Lines in square brackets above are comments, not actual output.
+
+gtk-val-slider
+^^^^^^^^^^^^^^
+
+Renders gtk3 window with a slider widget and writes value (float or int) picked
+there either to stdout or to a specified file, with some rate-limiting delay.
+
+Useful to mock/control values on a dev machine.
+
+E.g. instead of hardware sensors (which might be hard to get/connect/use), just
+setup app to read value(s) that should be there from file(s), specify proper
+value range to the thing and play around with values all you want to see what
+happens.
+
+
+
+backup
+~~~~~~
+
+Various dedicated backup tools and snippets.
+
+ssh-r-sync / ssh-r-sync-recv
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+"ssh -Rsync" - SSH shell and client to negotiate/run rsync pulls over ssh
+reverse tunnels ("ssh -R") without any extra client-side setup.
+
+Just running ``ssh-r-sync user@backup-host somedir`` should ssh into
+user\@backup-host, with auto-selected reverse-tunnel (-R) spec depending on
+local machine name, pass backup parameters and run ``rsync --daemon`` locally,
+allowing remote backup-host to initiate a pull from this daemon over established
+secure/authenticated ssh tunnel, picking appropriate destination path and most
+rsync parameters, rotating/removing stuff on the backup-fs (via hooks) as necessary.
+
+This is done to avoid following problematic things:
+
+- Pushing stuff to backup-host, which can be exploited to delete stuff.
+- Using insecure network channels and/or rsync auth - ssh only.
+- Having any kind of insecure auth or port open on backup-host (e.g. rsyncd) - ssh only.
+- Requiring backed-up machine to be accessible on the net for backup-pulls - can
+  be behind any amount of NAT layers, and only needs one outgoing ssh connection.
+- Specifying/handling backup parameters (beyond --filter lists), rotation and
+  cleanup on the backed-up machine - backup-host will handle all that in a
+  known-good and uniform manner.
+- Running rsyncd or such with unrestricted fs access "for backups" - only
+  runs it on localhost port with one-time auth for ssh connection lifetime,
+  restricted to specified read-only path, with local filter rules on top.
+- Needing anything beyond basic ssh/rsync/python on either side.
+
+Idea is to have backup process be as simple as ssh'ing into backup-host,
+only specifying path and filter specs for what it should grab.
+
+rsync is supposed to start by some regular uid on either end, so if full fs
+access is needed, -r/--rsync option can be used to point to rsync binary that
+has cap_dac_read_search (read) / cap_dac_override (write) posix capabilities
+or whatever wrapper script doing similar thing, e.g.::
+
+  # cp /usr/bin/rsync ~backup/
+  # setcap cap_dac_override,cap_chown,cap_fowner=ep ~backup/rsync
+
+| ...and add ``-r ~/rsync`` to ssh-r-sync-recv ForceCommand to use that binary.
+Note: rsync with full rw fs access is usually same as "NOPASSWD: ALL" sudo.
+
+To use any special rsync options or pre/post-sync actions on the backup-host side
+(such as backup file manifest, backup rotation and free space management,
+rsync output/errors checking, etc), hook scripts can be used there,
+see ``ssh-r-sync-recv --hook-list`` for more info.
+
+| Only needs python3 + ssh + rsync on either side.
+| See ``ssh-r-sync-recv -h`` for sshd_config setup notes.
+
+ssh-dump
+^^^^^^^^
+
+Bash wrapper around ssh to run it in non-interactive command mode, storing
+output to specified path with date-suffix and optional compression/rotation.
+
+Implements very basic operation of grabbing either some command output or file
+contents from remote host for backup purposes.
+
+Passes bunch of common options to use ssh batch mode, disable non-key auth and
+enable keepalive in case of long-running remote commands.
 
 
 desktop
@@ -1726,13 +1947,13 @@ its `loudnorm filter`_ (EBU R128 loudness normalization) in double-pass mode.
 Main purpose is to turn anything that has audio track in it into podcast for an
 audio player.
 
-Can process several source files or URLs (either audio content-type or URL for
-youtube-dl) in parallel, displays progress (from ``ffmpeg -progress`` pipe),
-python3/asyncio.
+Can process several source files or URLs (whatever youtube-dl accepts) in
+parallel, split large files into chunks (processed concurrently), displays
+progress (from ``ffmpeg -progress`` pipe), python3/asyncio.
 
-loudnorm filter and libebur128 are fairly recent additions to ffmpeg
-(3.1 release, 2016-06-27), and might not be enabled/available in distros by
-default (e.g. not enabled on Arch as of 2016-09-27).
+loudnorm filter is fairly recent addition to ffmpeg (added in 3.1 release of
+2016-06-27, has libebur128 built-in in 3.2+), and might not be available in
+distros by default.
 
 Needs youtube-dl installed if URLs are specified instead of regular files.
 
@@ -1753,9 +1974,11 @@ split
 '''''
 
 Simple bash script to split media files into chunks of specified length (in
-minutes), e.g.: ``split some-long-audiobook.mp3 sla 20`` will produce
+minutes), e.g. ``split some-long-audiobook.mp3 sla 20`` will produce
 20-min-long sla-001.mp3, sla-002.mp3, sla-003.mp3, etc.
-Last length arg can be omitted, and defaults to 15 min.
+
+| Last length arg can be omitted, and defaults to 15 min.
+| Can split/rename multiple files when used as e.g.: ``split prefix -- *.mp3``
 
 Uses ffprobe (ffmpeg) to get duration and ffmpeg with "-acodec copy -vn"
 (default, changed by passing these after duration arg) to grab only audio chunks
@@ -1922,9 +2145,15 @@ on some "magnet:..." link was successfully processed or discarded.
 power
 '''''
 
-Script to spam sounds and desktop-notifications upon detecting low battery
-level. Not the only one to do somethng like that on my system, but saved me some
-work on many occasions.
+Script to spam `desktop-notifications`_ when charger gets plugged/unplugged via
+udev rules on an old laptop with somewhat flaky power connector.
+
+Useful to save a few battery/power cycles due to random electrical contact loss
+in charger or just plain negligence, if nothing else in DE has good indication
+for that already.
+
+| Uses python3/pyudev and systemd dbus lib via ctypes for notifications.
+| Run with --print-systemd-unit to get systemd/udev templates.
 
 logtail
 '''''''
@@ -2082,30 +2311,42 @@ positions or current (`auto-rotated`_) wallpaper path.
 vfat_shuffler
 '''''''''''''
 
-Tool to shuffle entries inside a vfat (filesystem) directory (and do some other
-things) without actually mounting filesystem.
+Python script to list/shuffle/order and do some other things to LFN entries
+inside vfat filesystem directory without mounting the thing.
 
-Some crappy cheap mp3 players don't have shuffle functionality and play files
-strictly in the same order as their dentries_ appear on the device blocks.
+Implemented to work around limitations of crappy cheap mp3 players that don't
+have shuffle (or any ordering) functionality and cycle tracks in the same order
+as their dentries_ appear on fs.
 
-Easy way to "shuffle" stuff for them in quick-and-efficient manner is to swap
-dentries' places, which unfortunately requires re-implementing a bit of vfat
-driver code, which (fortunately) isn't that complex.
+Easy way to "shuffle" stuff for these in a quick and efficient manner is to swap
+dentries' places, which (unfortunately) requires re-implementing a bit of vfat
+driver code, which (fortunately) isn't that complicated.
 
 Tool takes path to device and directory to operate on as arguments (see --help)
-and has -s/--shuffle (actual shuffle operation), -l/--list (simply list files,
-default), -r/--rename action-flags, and ``--debug --dry-run`` can be useful to
-check what thing will do without making any changes.
+and has -l/--list (simply list files, default), -s/--shuffle (shuffle
+operation), ---o/order, --rename plus some other action-opts (all support
+-r/--recursive operation), and ``--debug --dry-run`` can be useful to check what
+script does without making any fs changes (opens device read-only).
 
-One limitation is that it works *only* with FAT32 "vfat" fs type, which can be
-created with "mkfs.vfat" tool, *not* the types that "mkdosfs" tool creates,
-*not* FAT16 or whatever other variations are out there.
-Only reason is that I didn't bother to learn the differences between these, just
-checked and saw parser bug out on mkdosfs-created fs format.
+See -h/--help output for more info and usage examples.
 
-Might be useful baseline to hack some fat32-related tool, as it has everything
+One limitation is that it only works with FAT32 "vfat" fs type, which can be
+created via "mkfs.vfat" tool, *not* the stuff that "mkdosfs" tool creates,
+*not* FAT16, FAT12, exFAT or whatever other variations are out there (they're
+slightly different and I didn't need any of them, so not implemented).
+
+Might be useful base to hack some fat32-related tool, as it has everything
 necessary for full r/w implementation - e.g. a tool to hardlink files on fat32,
 create infinite dir loops, undelete tool, etc.
+
+Due to bunch of heavy parsing done inside, can take a few seconds to process
+whole fs structure, and works ~5x faster with `pypy <http://pypy.org/>`_
+(e.g. 1.5s instead of 9s).
+
+Uses python/pypy 3.x and `construct module <https://construct.readthedocs.io/>`_.
+
+Somewhat similar project (which I didn't find at the time of implementing this
+back in 2013) - `maxpat78/FATtools <https://github.com/maxpat78/FATtools/>`_.
 
 .. _dentries: https://en.wikipedia.org/wiki/File_Allocation_Table#Directory_entry
 
@@ -2293,6 +2534,30 @@ Requires python3, python-evdev_, standard "uinput" kernel module enabled/loaded,
 read access to specified evdev(s) and rw to /dev/uinput.
 
 .. _python-evdev: http://python-evdev.readthedocs.org/
+
+exclip
+''''''
+
+Small standalone C binary based on xclip_ code to copy primary X11 selection
+text (utf-8) from terminal (or whatever else) to clipboard as a single line,
+stripping any stray tabs/newlines that might get in there (due to terminal
+quirks, e.g. with screen/tmux/ncurses) and spaces at the start/end,
+unless -x/--verbatim is specified.
+
+Basically what something like "xclip -out | <process> | xclip -in" would do,
+except as a tiny fast-to-run binary (to bind to a key), and with multiplexing
+(to clipboard and back to primary).
+
+Build with: ``gcc -O2 -lX11 -lXmu exclip.c -o exclip && strip exclip``
+
+Safe wrt NUL-bytes, but should not be used without -x/--verbatim on multi-byte
+non-utf-8 encodings (where \\n byte can mean something else), and won't strip
+any weird non-ascii utf-8 spaces.
+
+Has -d/--slashes-to-dots option to copy paths as dotted prefixes, with same
+caveats as above.
+
+.. _xclip: https://github.com/astrand/xclip
 
 
 
@@ -2522,6 +2787,26 @@ There's more info on it in `gnuplot-for-live-last-30-seconds`_ blog post.
 
 .. _gnuplot-for-live-last-30-seconds: http://blog.fraggod.net/2015/03/25/gnuplot-for-live-last-30-seconds-sliding-window-of-free-memory-data.html
 
+rsync-diff
+^^^^^^^^^^
+
+Script to sync paths, based on berkley db and rsync.
+
+Keeps b-tree of paths (files and dirs) and corresponding mtimes in berkdb,
+comparing state when ran and building a simple merge-filter for rsync (``+
+/path`` line for each changed file/dir, including their path components, ending
+with ``- *``). Then it runs a single rsync with this filter to efficiently sync
+the paths.
+
+Note that the only difference from "rsync -a src dst" here is that "dst" tree
+doesn't have to exist on fs, otherwise scanning "dst" should be pretty much the
+same (and probably more efficient, depending on fs implementation) b-tree
+traversal as with berkdb.
+
+Wrote it before realizing that it's quite pointless for my mirroring use-case -
+do have full source and destination trees, so rsync can be used to compare
+(if diff file-list is needed) or sync them.
+
 pcap-process
 ^^^^^^^^^^^^
 
@@ -2567,10 +2852,22 @@ blog post.
 .. _util-linux: https://www.kernel.org/pub/linux/utils/util-linux/
 .. _parted: http://www.gnu.org/software/parted/parted.html
 
+d3-line-chart-boilerplate
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Boilerplate `d3.js`_ page for basic line chart to plot arbitrary JS function
+outputs or data array with axii, grid, mouseover datapoint tooltips and such.
+
+Useful when for a quick chart to figure out some data or function output,
+or make it into a useful non-static link to someone,
+and don't want to deal with d3-v3/coding-style/JS diffs from bl.ocks.org.
+
+.. _d3.js: http://d3js.org/
+
 d3-temp-rh-sensor-tsv-series-chart
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-`D3`_-based ES6 graphing app for time-series data from rather common
+`d3.js`_-based ES6 graphing app for time-series data from rather common
 temperature (t) and relative humidity (rh) sensors (DHT22, sht1x, etc) in tsv
 (tab-separated-values) files with [iso8601-ts, t, rh] fields.
 
@@ -2585,7 +2882,6 @@ this repo, doesn't have any external links, can be easily used as a local file.
 More info can be found in the `d3-chart-for-common-temperaturerh-time-series-data`_
 blog post.
 
-.. _D3: http://d3js.org/
 .. _d3-temp-rh-sensor-tsv-series-chart.html: https://mk-fg.github.io/fgtk/scraps/d3-temp-rh-sensor-tsv-series-chart.html
 .. _d3-temp-rh-sensor-tsv-series-chart.zip: https://github.com/mk-fg/fgtk/raw/master/scraps/d3-temp-rh-sensor-tsv-series-chart.sample.zip
 .. _d3-chart-for-common-temperaturerh-time-series-data: http://blog.fraggod.net/2016/08/05/d3-chart-for-common-temperaturerh-time-series-data.html
@@ -2687,6 +2983,41 @@ Python3, uses dbus-python module and its glib eventloop.
 
 .. _wpa_supplicant: https://w1.fi/wpa_supplicant/
 .. _hostapd: https://w1.fi/hostapd/
+
+mem-search-replace
+^^^^^^^^^^^^^^^^^^
+
+Unfinished simple python3 script to search/replace memory of a process via
+process_vm_readv / process_vm_writev calls while it's running.
+
+Useful for hacks to update stuff in running binary apps without having to
+restart or disrupt them in any way, but found that this approach was too tedious
+in my specific case due to how stuff is stored there, so didn't bother with
+process_vm_writev part.
+
+gpm-track
+^^^^^^^^^
+
+Py3 script to capture and print mouse events from GPM_ (as in libgpm) in
+specified tty.
+
+Main event receiver is gpm-track.c (build with ``gcc -O2 gpm-track.c -o
+gpm-track -lgpm -lrt``) proxy-binary though, which writes latest mouse position
+to mmap'ed shared memory file (under /dev/shm) and sends SIGRT* signals to main
+process on mouse clicks.
+
+Python wrapper runs that binary and reads position at its own pace,
+reacting to clicks immediately via signals.
+
+Such separation can be useful to have python only receive click events while C
+binary tracks position and draws cursor itself in whatever fashion (e.g. on a
+top-level layer via RPi's OpenVG API), without needing to do all that separate
+low-latency work in python.
+
+Note that GPM tracks x/y in row/column format, not pixels, which isn't very
+useful for GUIs, alas.
+
+.. _GPM: https://github.com/telmich/gpm
 
 
 License (WTFPL)

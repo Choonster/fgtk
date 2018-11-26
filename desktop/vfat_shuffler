@@ -1,74 +1,54 @@
-#!/usr/bin/env python2
-# -*- coding: utf-8 -*-
-from __future__ import print_function
+#!/usr/bin/env python3
 
 from construct import (
-	Struct, Byte, Bytes, ULInt8, ULInt16, ULInt32, Enum, Array,
-	Padding, Embed, Pass, BitStruct, Flag, Const, ExprAdapter )
-from construct.core import FieldError
+	Struct, Byte, Bytes, Int8ul, Int16ul, Int32ul, Enum, Array,
+	Padding, Embedded, Pass, BitStruct, Flag, Const, ExprAdapter )
+from construct.core import StreamError
 
 import itertools as it, operator as op, functools as ft
-from io import BytesIO, BufferedReader
-from os.path import normpath
-import os, sys, types, random
+from io import BytesIO
+import os, sys, random, collections
 
 
-def force_bytes(bytes_or_unicode, encoding='utf-8', errors='backslashreplace'):
-	if not isinstance(bytes_or_unicode, types.StringTypes):
-		return bytes(bytes_or_unicode)
-	elif isinstance(bytes_or_unicode, bytes):
-		return bytes_or_unicode
-	return bytes_or_unicode.encode(encoding, errors)
+Fat32Header = Struct(
+	'jumpInstruction' / Bytes(3), # Boot Sector start
+	'creatingSystemId' / Bytes(8),
+	'sectorSize' / Int16ul, # FAT32 Extended BIOS Parameter Block start
+	'sectorsPerCluster' / Byte,
+	'reservedSectorCount' / Int16ul,
+	'fatCount' / Byte,
+	'rootdirEntryCount' / Int16ul,
+	'sectorCount_small' / Int16ul,
+	'mediaId' / Byte,
+	'sectorsPerFat' / Int16ul, # 0 for FAT32, BIOS Parameter Block end
+	'sectorsPerTrack' / Int16ul,
+	'sideCount' / Int16ul,
+	'hiddenSectorCount' / Int32ul,
+	'sectorCount_large' / Int32ul, # DOS 3.31 BPB end
+	'sectorsPerFat_large' / Int32ul,
+	'driveFlags' / Bytes(2),
+	'Version' / Bytes(2),
+	'clusterOfRoot' / Int32ul,
+	'fsInfoSectorNo' / Int16ul,
+	'bsCopySectorNo' / Int16ul,
+	'Reserved' / Bytes(12),
+	'physicalDriveNumber' / Byte,
+	'currentHead' / Byte,
+	'extendedBootSignature' / Byte,
+	'volumeId' / Bytes(4),
+	'volumeLabel' / Bytes(11),
+	'fsType' / Const(b'FAT32   '), # FAT32 Extended BIOS Parameter Block end
+	'bootCode' / Bytes(419),
+	'physicalDriveNumber_old' / Byte,
+	'bootSectorSignature' / Const(b'\x55\xaa') )
 
-def force_unicode(bytes_or_unicode, encoding='utf-8', errors='replace'):
-	if not isinstance(bytes_or_unicode, types.StringTypes):
-		return unicode(bytes_or_unicode)
-	elif isinstance(bytes_or_unicode, unicode):
-		return bytes_or_unicode
-	return bytes_or_unicode.decode(encoding, errors)
-
-f2uni = lambda field: force_unicode(field.rstrip()).rstrip()
-
-
-Fat32Header = Struct( 'fat_header',
-	Bytes('jumpInstruction', 3), # Boot Sector start
-	Bytes('creatingSystemId', 8),
-	ULInt16('sectorSize'), # FAT32 Extended BIOS Parameter Block start
-	Byte('sectorsPerCluster'),
-	ULInt16('reservedSectorCount'),
-	Byte('fatCount'),
-	ULInt16('rootdirEntryCount'),
-	ULInt16('sectorCount_small'),
-	Byte('mediaId'),
-	ULInt16('sectorsPerFat'), # 0 for FAT32, BIOS Parameter Block end
-	ULInt16('sectorsPerTrack'),
-	ULInt16('sideCount'),
-	ULInt32('hiddenSectorCount'),
-	ULInt32('sectorCount_large'), # DOS 3.31 BPB end
-	ULInt32('sectorsPerFat_large'),
-	Bytes('driveFlags', 2),
-	Bytes('Version', 2),
-	ULInt32('clusterOfRoot'),
-	ULInt16('fsInfoSectorNo'),
-	ULInt16('bsCopySectorNo'),
-	Bytes('Reserved', 12),
-	Byte('physicalDriveNumber'),
-	Byte('currentHead'),
-	Byte('extendedBootSignature'),
-	Bytes('volumeId', 4),
-	Bytes('volumeLabel', 11),
-	Const(Bytes('fsType', 8), 'FAT32   '), # FAT32 Extended BIOS Parameter Block end
-	Bytes('bootCode', 419),
-	Byte('physicalDriveNumber_old'),
-	Const(Bytes('bootSectorSignature', 2), '\x55\xaa') )
-
-BootSector = Struct( 'boot_sector',
-	Embed(Fat32Header),
+BootSector = Struct(
+	Embedded(Fat32Header),
 	Padding(lambda ctx: ctx.sectorSize - Fat32Header.sizeof()) )
 
 FatEntry = Enum(
 	ExprAdapter(
-		ULInt32('fats'),
+		'fats' / Int32ul,
 		encoder=lambda obj,ctx: obj,
 		decoder=lambda obj,ctx: obj & 0x0fffffff ), # upper nibble is reserved
 	free=0x0000000,
@@ -78,79 +58,79 @@ FatEntry = Enum(
 	_default_=Pass )
 
 
-def ts_hms(name):
-	return ExprAdapter(
-		ULInt16(name),
-		encoder=lambda ts,ctx: (ts[0] << 11) + (ts[1] << 5) + ts[2] / 2,
-		decoder=lambda n,ctx: (n >> 11, (n >> 5) & (2**6 - 1), (n & (2**5 - 1)) * 2) )
+ts_hms = ExprAdapter(
+	Int16ul,
+	encoder=lambda ts,ctx: (ts[0] << 11) + (ts[1] << 5) + ts[2] // 2,
+	decoder=lambda n,ctx: (n >> 11, (n >> 5) & (2**6 - 1), (n & (2**5 - 1)) * 2) )
 
-def ts_ymd(name):
-	return ExprAdapter(
-		ULInt16(name),
+ts_ymd = ExprAdapter(
+		Int16ul,
 		encoder=lambda ts,ctx: ((ts[0] - 1980) << 9) + (ts[1] << 5) + ts[2],
 		decoder=lambda n,ctx: (1980 + (n >> 9), (n >> 5) & (2**4 - 1), n & (2**5 - 1)) )
 
 # Should have Switch in it for LFN, but not sure how to integrate it
-DirEntry = Struct( 'dir_entry',
-	Bytes('name', 8),
-	Bytes('extension', 3),
-	BitStruct( 'attributes',
-		Flag('unused'),
-		Flag('device'),
-		Flag('archive'),
-		Flag('subDirectory'),
-		Flag('volumeLabel'),
-		Flag('system'),
-		Flag('hidden'),
-		Flag('readonly') ),
-	Byte('reserved_flags'),
-	Byte('undelete_char_or_ctime_ms'),
-	ts_hms('ctime_hms'),
-	ts_ymd('ctime_ymd'),
-	ts_ymd('atime_ymd'),
-	ULInt16('firstCluster_high'),
-	ts_hms('mtime_hms'),
-	ts_ymd('mtime_ymd'),
-	ULInt16('firstCluster_low'),
-	ULInt32('fileSize') )
+DirEntry = Struct(
+	'name' / Bytes(8),
+	'extension' / Bytes(3),
+	'attributes' / BitStruct(
+		'unused' / Flag,
+		'device' / Flag,
+		'archive' / Flag,
+		'subDirectory' / Flag,
+		'volumeLabel' / Flag,
+		'system' / Flag,
+		'hidden' / Flag,
+		'readonly' / Flag ),
+	'reserved_flags' / Byte,
+	'undelete_char_or_ctime_ms' / Byte,
+	'ctime_hms' / ts_hms,
+	'ctime_ymd' / ts_ymd,
+	'atime_ymd' / ts_ymd,
+	'firstCluster_high' / Int16ul,
+	'mtime_hms' / ts_hms,
+	'mtime_ymd' / ts_ymd,
+	'firstCluster_low' / Int16ul,
+	'fileSize' / Int32ul )
 
-LFNEntry = Struct( 'lfn_entry',
-	ULInt8('seq'),
-	Bytes('name1', 10),
-	BitStruct( 'attributes', # always 0xfd for LFN
-		Flag('unused'),
-		Flag('device'),
-		Flag('archive'),
-		Flag('subDirectory'),
-		Flag('volumeLabel'),
-		Flag('system'),
-		Flag('hidden'),
-		Flag('readonly') ),
-	Byte('type'), # always 0x00
-	ULInt8('checksum'),
-	Bytes('name2', 12),
-	Bytes('first_cluster', 2), # always 0x0000
-	Bytes('name3', 4) )
+LFNEntry = Struct(
+	'seq' / Int8ul,
+	'name1' / Bytes(10),
+	'attributes' / BitStruct( # always 0xfd for LFN
+		'unused' / Flag,
+		'device' / Flag,
+		'archive' / Flag,
+		'subDirectory' / Flag,
+		'volumeLabel' / Flag,
+		'system' / Flag,
+		'hidden' / Flag,
+		'readonly' / Flag ),
+	'type' / Byte, # always 0x00
+	'checksum' / Int8ul,
+	'name2' / Bytes(12),
+	'first_cluster' / Bytes(2), # always 0x0000
+	'name3' / Bytes(4) )
 
 
 def PreDataRegion(fsinfo=False, fats=True):
-	entries = [Embed(BootSector)]
+	entries = [Embedded(BootSector)]
 	reserved_padding = Padding(lambda ctx: (ctx.reservedSectorCount - 1) * ctx.sectorSize)
 	if fsinfo:
 		entries.append(Padding(lambda ctx: (ctx.fsInfoSectorNo - 1) * ctx.sectorSize))
 		# https://en.wikipedia.org/wiki/File_Allocation_Table#FS_Information_Sector
-		# entries.append(Embed(FSInfoSector('fsInfoSector')))
+		# entries.append(Embedded(FSInfoSector('fsInfoSector')))
 		reserved_padding = Padding(
 			lambda ctx: (ctx.reservedSectorCount - ctx.fsInfoSectorNo - 1) * ctx.sectorSize )
 		raise NotImplementedError
 	if fats:
 		entries.append(reserved_padding)
-		entries.append(Array( lambda ctx: ctx.fatCount,
-			Array(lambda ctx: ctx.sectorsPerFat_large * ctx.sectorSize / FatEntry.sizeof(), FatEntry) ))
-	return Struct('pdr', *entries)
+		entries.append('fats' / Array( lambda ctx: ctx.fatCount,
+			Array(lambda ctx: ctx.sectorsPerFat_large * ctx.sectorSize // FatEntry.sizeof(), FatEntry) ))
+	return Struct(*entries)
 
 
 class File(object):
+
+	name_long = None
 
 	def __init__(self, de, fs):
 		self.de, self.fs = de, fs
@@ -164,13 +144,13 @@ class File(object):
 		for entry in de_list:
 			entry_id = 'DirEntry[{}]'.format(entry.clidx)
 
-			if entry.name[0] == '\xe5': continue # deleted
-			if entry.name[0] in '\x2e': # dot-entries
-				entry.lfns, entry.name_long = list(), f2uni(entry.name)
-				assert not entry.name_long.strip(u'.'), repr(entry.name_long)
+			if entry.name[0] == 0xe5: continue # deleted
+			if entry.name[0] == 0x2e: # dot-entries
+				entry.lfns, entry.name_long = list(), entry.name.decode()
+				assert not entry.name_long.strip('. '), repr(entry.name_long)
 				yield DotEntry(entry, fs)
 				continue
-			assert entry.name[0] != '\0', repr(entry.name)
+			assert entry.name[0] != 0, repr(entry.name)
 
 			stream = entry.pop('_chain_stream') # if only to free the ref
 			log.debug('DirEnty[%s] at %s', entry.clidx, entry.slice_map_offset)
@@ -197,19 +177,19 @@ class File(object):
 				lfn_name = it.chain.from_iterable(
 					[lfn.name1, lfn.name2, lfn.name3]
 					for lfn in sorted(lfn_cache, key=op.attrgetter('seq_num')) )
-				entry.name_long = ''.join(lfn_name).decode('utf-16').split(u'\0')[0]
+				entry.name_long = b''.join(lfn_name).decode('utf-16').split('\0')[0]
 				lfn_cache, entry.lfns = list(), lfn_cache
-				csum, name = 0, iter(entry.name + '\0' * (len(entry.name) - 8) + entry.extension)
-				for n in xrange(11):
+				csum, name = 0, iter(entry.name + b'\0' * (len(entry.name) - 8) + entry.extension)
+				for n in range(11):
 					c = next(name)
-					csum = (((csum & 1) << 7) + (csum >> 1) + ord(c)) & 0xff
+					csum = (((csum & 1) << 7) + (csum >> 1) + c) & 0xff
 				assert csum == lfn_csum, [csum, lfn_csum]
 
 			else:
 				name = entry.name
-				if name[0] == '\x05': name = '\xe5' + name[1:] # 0x05 - Initial character is actually 0xE5
+				if name[0] == 0x05: name = b'\xe5' + name[1:] # 0x05 - Initial character is actually 0xE5
 				entry.lfns, entry.name_long = list(),\
-					u'{}.{}'.format(f2uni(name), f2uni(entry.extension))
+					'{}.{}'.format(name.decode(), entry.extension.decode())
 
 			is_dir = entry.attributes.subDirectory
 			log.debug('Parsing %s: %r (%s)', entry_id, entry.name_long, 'dir' if is_dir else 'file')
@@ -222,22 +202,22 @@ class File(object):
 		return self.fs.get_chain(self.firstCluster)
 
 	def get_slice_map(self):
-		return map(self.fs.get_slice, self.get_chain())
+		return list(map(self.fs.get_slice, self.get_chain()))
 
 	@property
 	def firstCluster(self):
 		return (self.de.firstCluster_high << 16) + self.de.firstCluster_low
 
-	@property
-	def name(self): return self.name_tpl.format(self.de, self)
-	def __str__(self): return self.name
-
-	name_tpl = u'[{1.firstCluster}] {0.name_long}'
+	def __str__(self): return f'[{self.firstCluster:7d}] {self.de.name_long}'
+	def __repr__(self):
+		return ( f'<{self.__class__.__name__}'
+			f' {self.firstCluster}:[{self.de.name_long!r}]>' )
 
 
 class DotEntry(File):
 
-	name_tpl = u'[ ] {0.name_long}'
+	def __str__(self): return f'[{" "*7}] {self.de.name_long}'
+	def __repr__(self): return f'<{self.__class__.__name__} [{self.de.name_long.strip()}]>'
 
 
 class Directory(File):
@@ -246,33 +226,35 @@ class Directory(File):
 		super(Directory, self).__init__(de, fs)
 		self.children = list(self.parse_des(self.fs.get_des(self.firstCluster), fs))
 
-	def shuffled_structs( self,
-			group_dirs='first',
-			order_func=random.shuffle,
-			order_dirs=lambda dirs: sorted(dirs, key=op.attrgetter('de.name_long')) ):
+	struct_tuple = collections.namedtuple('StructTuple', 'struct data')
+	def iter_struct_tuples( self,
+			sort_func=None, group_dirs=None, group_dirs_sort_func=None ):
 		assert group_dirs in [None, False, 'first', 'last'], group_dirs
+		if not sort_func: sort_func = lambda des: None
+		if not group_dirs_sort_func: group_dirs_sort_func = sort_func
 
-		parts = [list(), list(), list(), list()]
+		parts = collections.namedtuple( 'Parts',
+			'dots dirs_first whatever dirs_last' )(list(), list(), list(), list())
 		for obj in self.children:
 			if group_dirs and isinstance(obj, Directory):
-				if group_dirs == 'first': dst = parts[1]
-				elif group_dirs == 'last': dst = parts[3]
+				if group_dirs == 'first': dst = parts.dirs_first
+				elif group_dirs == 'last': dst = parts.dirs_last
 				else: raise ValueError(group_dirs)
-			elif isinstance(obj, DotEntry): dst = parts[0]
-			else: dst = parts[2]
+			elif isinstance(obj, DotEntry): dst = parts.dots
+			else: dst = parts.whatever
 			dst.append(obj)
 
-		for n, entries in enumerate(parts):
-			if n == 0: continue # dotentries
-			res = (order_func if n == 2 else order_dirs)(entries)
-			if res is None: continue # assuming it's in-place list sorter
-			parts[n] = res
+		for k, des in parts._asdict().items():
+			if k == 'dots': continue # dotentries
+			res = (sort_func if k == 'whatever' else group_dirs_sort_func)(des)
+			if res is None: continue # assuming it's an in-place list sorter
+			des[:] = res
 
-		log.debug('Resulting order:')
+		log.debug('Resulting directory order:')
 		for obj in it.chain(*parts):
 			log.debug('  %s', obj)
-			for lfn in obj.de.lfns: yield (LFNEntry, lfn)
-			yield (DirEntry, obj.de)
+			for lfn in obj.de.lfns: yield self.struct_tuple(LFNEntry, lfn)
+			yield self.struct_tuple(DirEntry, obj.de)
 
 	def __getitem__(self, name):
 		for obj in self.children:
@@ -282,7 +264,7 @@ class Directory(File):
 	def __iter__(self):
 		return iter(self.children)
 
-	name_tpl = u'[{1.firstCluster}] {0.name_long}/'
+	def __str__(self): return f'[{self.firstCluster:7d}] {self.de.name_long}/'
 
 
 class FatFs(Directory):
@@ -301,7 +283,7 @@ class FatFs(Directory):
 	def get_next_cluster(self, clidx):
 		ress = set([fat[clidx] for fat in self.pdr.fats])
 		if len(ress) == 1: return ress.pop()
-		log.error('Inconsistencie between FATs: %s points to', clidx)
+		log.error('Inconsistency between FATs: %s points to', clidx)
 		for i, fat in enumerate(self.pdr.fats):
 			log.error('    %s according to fat #%s' , fat[clidx], i)
 		res = ress.pop()
@@ -311,7 +293,7 @@ class FatFs(Directory):
 	def get_chain(self, clidx):
 		res, clidx_start = [], clidx
 		while clidx < 0xffffff8: # last cluster is 0xffffff8-0xfffffff
-			assert isinstance(clidx, (int, long)), clidx
+			assert isinstance(clidx, int), clidx
 			assert 2 <= clidx <= 0xfffffef, 'Non-data cluster: {}'.format(hex(clidx))
 			res.append(clidx)
 			clidx = self.get_next_cluster(clidx)
@@ -364,7 +346,7 @@ class FatFs(Directory):
 				mem.seek(-1, os.SEEK_CUR)
 				pos = mem.tell()
 				obj = DirEntry.parse_stream(mem)
-				if obj.name[0] == '\0': break # sentinel entry
+				if obj.name[0] == 0: break # sentinel entry
 				obj.clidx, obj._chain_stream = clidx, mem
 				obj.slice_map, obj.slice_map_offset = slice_map, pos
 				yield obj
@@ -409,53 +391,235 @@ class FatFs(Directory):
 	name_tpl = '[{1.pdr.clusterOfRoot}] /'
 
 
+def run_proc(cmd, sudo=False, out=True, **kws):
+	import subprocess
+	if isinstance(cmd, str): cmd = cmd.split()
+	else: cmd = list(map(str, cmd))
+	if sudo: cmd = ['sudo', '-n'] + cmd
+	log.debug('Command: %s', ' '.join(cmd))
+	if out is ...:
+		kws.update(
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL )
+	elif out: kws.update(check=True, stdout=subprocess.PIPE)
+	res = subprocess.run(cmd, **kws)
+	return res.stdout.decode() if out is True else res
+
+def op_resolve_mp(vfs_path):
+	import json, pathlib as pl
+	path = pl.Path(vfs_path).resolve()
+	lsblk = json.loads(run_proc('lsblk --json --paths'.split()))
+	mp_list, lsblk = list(), collections.deque(lsblk['blockdevices'])
+	while lsblk:
+		dev = lsblk.popleft()
+		lsblk.extend(dev.get('children') or list())
+		mp = dev.get('mountpoint')
+		if not mp: continue
+		try: p = path.relative_to(mp)
+		except ValueError: pass
+		else: mp_list.append((dev['name'], str(p), str(mp)))
+	dev, path, mp = sorted(mp_list, key=lambda dev: len(dev[2]))[-1]
+	if mp == '/': parser.error(f'Failed to resolve path to non-root mountpoint: {path}')
+	return dev, path, mp
+
+def op_navigate(root, path):
+	path, slugs = root, os.path.normpath(path).lstrip(os.sep).split(os.sep)
+	for k in filter(None, slugs): path = path[k]
+	return path
+
+def op_recurse(*paths):
+	paths, path_queue = list(), collections.deque(paths)
+	while path_queue:
+		p = path_queue.popleft()
+		if not isinstance(p, Directory): continue
+		paths.append(p)
+		path_queue.extend(p.children)
+	return paths
+
+
+def op_list(path, recursive=False, indent=0, print_line=None):
+	if print_line is None:
+		def print_line(line='', pad_in=False, pad_out=False):
+			if pad_in and not print_line.pad_state: print()
+			if line: print(line)
+			if pad_out: print()
+			print_line.pad_state = pad_out
+		print_line.pad_state = True
+	for p in path:
+		if isinstance(p, DotEntry): continue
+		recurse = recursive and isinstance(p, Directory)
+		print_line(indent*' ' + str(p), pad_in=recurse)
+		if recurse:
+			op_list(p, recursive=True, indent=indent+3, print_line=print_line)
+			print_line(pad_out=True)
+
+def op_rename(path, tpl, dry_run=False):
+	name = tpl.decode('utf-8').format(name=path.de.name_long)
+	log.debug('Renaming %s -> %r', path, name)
+	with BytesIO((name + '\0').encode('utf-16')) as name_raw:
+		name_raw.seek(0)
+		assert name_raw.read(2) == b'\xff\xfe' # BOM
+		for lfn in path.de.lfns:
+			for field in LFNEntry.subcons:
+				if field.name in ['name1', 'name2', 'name3']:
+					field_len = field.sizeof()
+					data = name_raw.read(field_len)
+					lfn[field.name] = data + b'\xff' * (field_len - len(data))
+			fs.write_struct(LFNEntry, lfn, dry_run=dry_run)
+
+def op_reorder(path, src, dry_run=False, **reorder_kws):
+	path_sts_orig = list(path.iter_struct_tuples())
+	path_sts_sorted = list(path.iter_struct_tuples(**reorder_kws))
+
+	path_sts_hashed = [
+		tuple(id(st.data) for st in sts)
+		for sts in [path_sts_orig, path_sts_sorted] ]
+	if path_sts_hashed[0] == path_sts_hashed[1]:
+		log.debug('Reorder for path was not needed, skipping: %r', path)
+		return
+
+	with BytesIO() as mem:
+		# Dump all path_structs to mem
+		for struct, data in path_sts_sorted:
+			# log.debug('Writing-out struct (%sB):\n%s', struct.sizeof(), data)
+			try: struct.build_stream(data, mem)
+			except StreamError:
+				log.error('Failed to serialize construct: %s', data)
+				raise
+		slice_map = path.get_slice_map()
+		len_structs, len_clusters = mem.tell(), sum(map(op.itemgetter(1), slice_map))
+		assert len_structs <= len_clusters, [len_structs, len_clusters]
+
+		# Actual write operation
+		mem.seek(0)
+		for start, length in slice_map:
+			src.seek(start)
+			chunk = mem.read(length)
+			log.info(
+				'Writing %sB to offset: %s (hex: %s, len_left: %s)',
+				len(chunk), start, hex(start), length )
+			if not dry_run: src.write(chunk)
+			length -= len(chunk)
+			if length > 0:
+				chunk = b'\0'*length
+				log.info('Padding remaining %sB with zeroes', len(chunk))
+				if not dry_run: src.write(chunk)
+		assert mem.tell() == len_structs, [mem.tell(), len_structs]
+
 
 def main(args=None):
-	import argparse
-	parser = argparse.ArgumentParser(
-		description='Raw FAT32 manipulation tool.'
-			' Simply lists files in specified directory by default.'
-			' Use options like -s/--shuffle and -r/--rename to specify other actions.')
+	import argparse, textwrap
 
-	parser.add_argument('dev', help='Path to FAT32 device.')
-	parser.add_argument('path',
+	dedent = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
+	class SmartHelpFormatter(argparse.HelpFormatter):
+		def __init__(self, *args, **kws):
+			return super().__init__(*args, **kws, width=100)
+		def _fill_text(self, text, width, indent):
+			if '\n' not in text: return super()._fill_text(text, width, indent)
+			return ''.join(indent + line for line in text.splitlines(keepends=True))
+		def _split_lines(self, text, width):
+			return super()._split_lines(text, width)\
+				if '\n' not in text else dedent(text).splitlines()
+
+	parser = argparse.ArgumentParser(
+		formatter_class=SmartHelpFormatter,
+		description=dedent('''
+			Raw FAT32 manipulation tool.
+			Simply lists files in specified directory by default.
+			Use options like -s/--shuffle and --rename to specify other actions.'''),
+		epilog=dedent('''
+			Usage examples:
+
+				List files in order they are stored (with -r/--recursive to do it recursively):
+					% vfat_shuffler /dev/sdd1 /music/misc
+					% vfat_shuffler -lr /dev/sdd1 /music
+
+				Order stuff alphabetically, grouping dirs before files (default for -g/--group-dirs):
+					% vfat_shuffler -o /dev/sdd1 /music/misc
+					% vfat_shuffler -or /dev/sdd1 /
+					% vfat_shuffler -o --case-insensitive /mnt/player/music/misc
+					% vfat_shuffler -or --sudo --umount /mnt/player/music
+
+				Shuffle files (randomize order):
+					% vfat_shuffler -srx /mnt/player/music
+		'''))
+
+	group = parser.add_argument_group('Device and path')
+	group.add_argument('dev_or_vfs_path',
+		help='''
+			Path to FAT32 device or mountpoint path.
+			If only path inside mountpoint is specified,
+			  device-name/path will be resolved using "lsblk" tool (util-linux) from it,
+			  device unmounted, acted upon, and remounted (default opts) to same mountpoint.''')
+	group.add_argument('path', nargs='?',
 		help='File/directory to operate on. Must start from /, example: /some/my/dir')
 
-	parser.add_argument('-l', '--list', action='store_true',
-		help='List path without shuffling anything, in entry-order.'
-			' Default action, if no other options are specified.')
+	group = parser.add_argument_group('Operations')
+	group.add_argument('-l', '--list', action='store_true',
+		help='''
+			List path without shuffling anything, in entry-order.
+			Default action, if no other options are specified.''')
+	group.add_argument('-s', '--shuffle', action='store_true',
+		help='''
+			Shuffle entries in specified directory.'
+			This reads all direntries there and writes them back in randomized order.
+			Intended for stupid devices (e.g. mp3 players) which rely on that.''')
+	group.add_argument('-o', '--order', action='store_true',
+		help='''
+			Alpha-sort entries in specified directory.
+			Same idea as -s/--shuffle, but does the opposite ordering-wise.''')
+	group.add_argument('--rename', metavar='template',
+		help='''
+			Rename specified node (file/dir) according to the template.
+			Only changes utf-16 name in LFNs, as that is all modern OSes seem to care about.
+			Template is for python str.format. Example: {name}.bak''')
 
-	parser.add_argument('-s', '--shuffle', action='store_true',
-		help='Shuffle entries in specified directory.'
-			' This reads all direntries there and writes them back in randomized order.'
-			' Intended for stupid devices (e.g. mp3 players) which rely on that.')
-	parser.add_argument('-g', '--group-dirs', default='first',
-		help='Group and sort directories at the beginning/end of the file entries.'
-			' Possible values: no, first, last. Only used with -s/--shuffle option.'
-			' Default: %(default)s')
+	group = parser.add_argument_group('Operation tweaks/options')
+	group.add_argument('-r', '--recursive', action='store_true',
+		help='Operate on all subdirectories recursively.')
+	group.add_argument('-c', '--case-insensitive', action='store_true',
+		help='Use case-insensitive ordering for'
+			' files/dirs with -o/--order and -g/--group-dirs options.')
+	group.add_argument('-g', '--group-dirs',
+		default='first', choices=['no', 'first', 'last'], metavar='type',
+		help='''
+			Group and alpha-sort directories at the beginning/end of the file entries.
+			Possible values: first (default), last, no.
+			Only used with -s/--shuffle and -o/--order operations.''')
+	group.add_argument('--rename-inside', action='store_true',
+		help='''
+			Rename all entries inside specified directory instead of directory itself.
+			When -r/--recursive is also specified, only renames files inside directories.
+			Used with --rename only.''')
+	group.add_argument('-x', '--sudo', action='store_true',
+		help='''
+			Use sudo for mount/umount commands
+				when vfs path is specified instead of device+path.''')
+	group.add_argument('-u', '--umount', action='store_true',
+		help='When operating on a mounted path, do not remount it back.')
 
-	parser.add_argument('-r', '--rename',
-		help='Rename specified node (file/dir) according to the template.'
-			' Only changes utf-16 name in LFNs, as that is all modern OSes seem to care about.'
-			' Template is for python str.format. Example: {name}.bak')
-	parser.add_argument('--rename-inside', action='store_true',
-		help='Rename all entries in specified directory instead of directory itself.')
-
-	parser.add_argument('-n', '--dry-run',
+	group = parser.add_argument_group('Debug/output options')
+	group.add_argument('-n', '--dry-run',
 		action='store_true', help='Dont write the data out, only print what goes where.')
-	parser.add_argument('-v', '--verbose', action='store_true', help='Verbose operation mode.')
-	parser.add_argument('-d', '--debug', action='store_true', help='Even more verbose operation.')
+	group.add_argument('-v', '--verbose', action='store_true', help='Verbose operation mode.')
+	group.add_argument('-d', '--debug', action='store_true', help='Even more verbose operation.')
 
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
-	if opts.group_dirs == 'no': opts.group_dirs = None
-	if not opts.path.startswith(os.sep):
-		parser.error( 'Path argument must begin with'
-			' slash (for typo-safety reasons): {!r}'.format(opts.path) )
-
-	if not (opts.shuffle or opts.rename): opts.list = True
-	if sum(map(bool, [opts.shuffle, opts.rename, opts.list])) != 1:
+	if not (opts.shuffle or opts.order or opts.rename): opts.list = True
+	if sum(map(bool, [opts.shuffle, opts.order, opts.rename, opts.list])) != 1:
 		parser.error('Only one action can be specified at the same time.')
+
+	if opts.shuffle or opts.order:
+		group_dirs = None if opts.group_dirs == 'no' else opts.group_dirs
+		alphasort_func = op.attrgetter('de.name_long')
+		if opts.case_insensitive:
+			alphasort_func = lambda e,_f=alphasort_func: _f(e).lower()
+		alphasort_func = ft.partial(sorted, key=alphasort_func)
+		if opts.shuffle: sort_func = random.shuffle
+		elif opts.order: sort_func = alphasort_func
+		sort_opts = dict( sort_func=sort_func,
+			group_dirs=group_dirs, group_dirs_sort_func=alphasort_func )
 
 	global log
 	import logging
@@ -465,62 +629,38 @@ def main(args=None):
 	logging.basicConfig(level=log)
 	log = logging.getLogger()
 
-	with open(opts.dev, 'r' if opts.list else 'r+') as src:
-		fs = path = FatFs(src)
+	dev, path, mp = opts.dev_or_vfs_path, opts.path, None
+	try:
+		if not path:
+			dev, path, mount = op_resolve_mp(dev)
+			os.chdir('/') # umount might fail otherwise
+			run_proc(['umount', mount], sudo=opts.sudo)
+			mp = mount
+		elif not path.startswith(os.sep):
+			parser.error( 'Path argument must begin with'
+				' slash (for typo-safety reasons): {!r}'.format(path) )
 
-		for k in it.ifilter( None,
-				normpath(opts.path).lstrip(os.sep).split(os.sep) ):
-			path = path[k]
+		src_mode = 'rb' if not opts.dry_run and opts.list else 'rb+'
+		with open(dev, src_mode) as src:
+			fs = FatFs(src)
+			paths = [op_navigate(fs, path)]
 
-		if opts.list:
-			for entry in path: print(entry)
-			return 0
+			if opts.list: return op_list(paths[0], recursive=opts.recursive)
+			if opts.recursive: paths = op_recurse(*paths)
 
-		if opts.rename:
-			def rename(path, tpl):
-				name = tpl.decode('utf-8').format(name=path.de.name_long)
-				log.debug('Renaming %s -> %r', path, name)
-				with BytesIO((name + u'\0').encode('utf-16')) as name_raw:
-					name_raw.seek(0)
-					assert name_raw.read(2) == '\xff\xfe' # BOM
-					for lfn in path.de.lfns:
-						for field in LFNEntry.subcons:
-							if field.name in ['name1', 'name2', 'name3']:
-								field_len = field.sizeof()
-								data = name_raw.read(field_len)
-								lfn[field.name] = data + '\xff' * (field_len - len(data))
-						fs.write_struct(LFNEntry, lfn, dry_run=opts.dry_run)
-			if not opts.rename_inside: rename(path, opts.rename)
-			else:
-				for entry in path: rename(entry, opts.rename)
-			return 0
+			for path in paths:
+				if opts.rename:
+					if not opts.rename_inside: op_rename(path, opts.rename)
+					else:
+						for entry in path:
+							op_rename(entry, opts.rename, dry_run=opts.dry_run)
+				elif opts.shuffle or opts.order:
+					op_reorder(path, src, dry_run=opts.dry_run, **sort_opts)
 
-		with BytesIO() as mem:
-			for struct, data in path.shuffled_structs(group_dirs=opts.group_dirs):
-				# log.debug('Writing-out struct (%sB):\n%s', struct.sizeof(), data)
-				try: struct.build_stream(data, mem)
-				except FieldError:
-					log.error('Failed to serialize construct: %s', data)
-					raise
-			slice_map = path.get_slice_map()
-			len_structs, len_clusters = mem.tell(), sum(it.imap(op.itemgetter(1), slice_map))
-			assert len_structs <= len_clusters, [len_structs, len_clusters]
-
-			# Actual write operation
-			mem.seek(0)
-			for start, length in slice_map:
-				src.seek(start)
-				chunk = mem.read(length)
-				log.info(
-					'Writing %sB to offset: %s (hex: %s, len_left: %s)',
-					len(chunk), start, hex(start), length )
-				if not opts.dry_run: src.write(chunk)
-				length -= len(chunk)
-				if length > 0:
-					chunk = '\0'*length
-					log.info('Padding remaining %sB with zeroes', len(chunk))
-					if not opts.dry_run: src.write(chunk)
-
-			assert mem.tell() == len_structs, [mem.tell(), len_structs]
+	finally:
+		if mp and not opts.umount:
+			res = run_proc(['mount', mp], sudo=opts.sudo, out=...) # fstab check
+			if res.returncode: res = run_proc(['mount', dev, mp], sudo=opts.sudo, out=...)
+			if res.returncode: res.check_returncode()
 
 if __name__ == '__main__': sys.exit(main())
