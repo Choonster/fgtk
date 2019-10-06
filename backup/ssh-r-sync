@@ -2,12 +2,11 @@
 
 import itertools as it, operator as op, functools as ft
 import os, sys, contextlib, collections, subprocess, socket, pwd
-import hashlib, math, json, base64, signal, time
-import tempfile, pathlib as pl
+import hashlib, math, json, base64, signal, time, re, tempfile, pathlib as pl
 
 
 p_fmt = lambda fmt,*a,**k: (
-	[fmt.format(*a,**k)] if isinstance(fmt, str) else [[fmt, *a], k] )
+	[fmt.format(*a,**k) if a or k else fmt] if isinstance(fmt, str) else [[fmt, *a], k] )
 p = lambda fmt,*a,**k: print(*p_fmt(fmt,*a,**k), file=sys.stderr, flush=True)
 
 
@@ -272,6 +271,12 @@ def main(args=None):
 	group.add_argument('-n', '--name', metavar='name',
 		help='Local machine name, which is used for backup'
 			' cleanup and deduplication. Picked as uname.nodename, if not specified.')
+	group.add_argument('--name-rpi', action='store_true',
+		help='Use "Serial" field from /proc/cpuinfo,'
+			' provided there by RPi kernel, as board-specific name.')
+	group.add_argument('--name-file', metavar='path',
+		help='Read specified file contents as the name, stripping spaces, slashes and such.'
+			' E.g. /sys/class/dmi/id/board_serial can be used on x86 platforms, if accessible.')
 	group.add_argument('-f', '--filter-file', metavar='path',
 		help='Local file to use as rsync daemon filter rules,'
 			' to be passed as "filter = merge <file>" in its config.')
@@ -283,6 +288,9 @@ def main(args=None):
 		help='Instruct receiver rsync-pull to use -x/--one-file-system option.')
 	group.add_argument('-X', '--fake-super', action='store_true',
 		help='Instruct receiver rsync-pull to use --fake-super option.')
+	group.add_argument('-t', '--handshake-timeout',
+		type=float, metavar='seconds', default=conf.hs_timeout,
+		help='Timeout waiting for handshake responses from remote side (default: %(default)ss).')
 
 	group = parser.add_argument_group('SSH options')
 	group.add_argument('-p', '--port', metavar='port',
@@ -313,6 +321,8 @@ def main(args=None):
 		else: sys.__excepthook__(err_t, err, err_tb)
 	sys.excepthook = print_error_msg_only
 
+	if opts.handshake_timeout: conf.hs_timeout = opts.handshake_timeout
+
 	for sig in 'int hup term'.upper().split():
 		signal.signal(getattr(signal, f'SIG{sig}'), lambda sig,frm: sys.exit(1))
 
@@ -342,7 +352,21 @@ def main(args=None):
 		if ssh_port and ssh_port != opts.port:
 			parser.error('Two different ssh ports specified via -p/--port option and in destination')
 		ssh_port = opts.port
-	name = opts.name or os.uname().nodename
+	if opts.name_rpi:
+		with open('/proc/cpuinfo') as src:
+			for line in src:
+				m = re.search(r'^\s*Serial\s*:\s*(\S+)\s*$', line)
+				if m: break
+			else: parser.error('Failed to find "Serial : ..." line in /proc/cpuinfo (non-RPi kernel?)')
+		name = m.group(1)
+	elif opts.name_file:
+		name = pl.Path(opts.name_file).read_text().strip()
+		for sub_re, sub in {
+				r'[\\/]': '_', r'^\.+': '_', r'[\x00-\x1f]': '_', r':': '-_',
+				r'<': '(', r'>': ')', r'\*': '+', r'[|!"]': '-', r'[\?\*]': '_',
+				'[\'’]': '', r'\.+$': '_', r'\s+$': '', r'\s': '_' }.items():
+			name = re.sub(sub_re, sub, name)
+	else: name = opts.name or os.uname().nodename
 	if opts.no_ssh_opts: conf.ssh_opts.clear()
 
 	if opts.debug: p(f'----- sync name={name} dst={ssh_dst}:{ssh_port or 22}')

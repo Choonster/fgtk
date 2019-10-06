@@ -14,7 +14,7 @@ class SSHMuxConfig:
 	ident_db_path = 'ssh-reverse-mux-ident.db'
 
 
-class LogMessage(object):
+class LogMessage:
 	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
 	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
 
@@ -25,21 +25,10 @@ class LogStyleAdapter(logging.LoggerAdapter):
 		if not self.isEnabledFor(level): return
 		log_kws = {} if 'exc_info' not in kws else dict(exc_info=kws.pop('exc_info'))
 		msg, kws = self.process(msg, kws)
-		self.logger._log(level, LogMessage(msg, args, kws), (), log_kws)
+		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
 
 get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
 
-
-async def asyncio_wait_or_cancel(
-		loop, task, timeout, default=..., cancel_suppress=None ):
-	if asyncio.iscoroutine(task): task = loop.create_task(task)
-	try: return await asyncio.wait_for(task, timeout)
-	except asyncio.TimeoutError as err:
-		task.cancel()
-		with contextlib.suppress(
-			asyncio.CancelledError, *(cancel_suppress or list()) ): await task
-		if default is ...: raise err
-		else: return default
 
 def retries_within_timeout( tries, timeout,
 		backoff_func=lambda e,n: ((e**n-1)/e), slack=1e-2 ):
@@ -230,6 +219,7 @@ def main(args=None, conf=None):
 		host, port_mux, sock_addr,
 		*(sockopt_resolve(pre, n) for pre, n in [
 			('af_', sock_af), ('sock_', sock_t), ('ipproto_', sock_p) ]) )
+	host, port_mux = sock_addr[:2]
 
 	try:
 		tun_port_a, tun_port_b = map(int, opts.tunnel_port_range.split(':', 1))

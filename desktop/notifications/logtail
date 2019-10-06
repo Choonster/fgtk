@@ -9,7 +9,7 @@ import enum, struct, select, termios, glob, re
 import os, sys, errno, ctypes, fcntl, time, logging
 
 
-class LogMessage(object):
+class LogMessage:
 	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
 	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
 
@@ -20,7 +20,7 @@ class LogStyleAdapter(logging.LoggerAdapter):
 		if not self.isEnabledFor(level): return
 		log_kws = {} if 'exc_info' not in kws else dict(exc_info=kws.pop('exc_info'))
 		msg, kws = self.process(msg, kws)
-		self.logger._log(level, LogMessage(msg, args, kws), (), log_kws)
+		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
 
 get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
 
@@ -204,8 +204,10 @@ class INotify:
 			n += self._INotifyEv_struct_len
 			name = ctypes.c_buffer(buff[n:n + name_len], name_len).value.decode()
 			n += name_len
-			evs.append(self.INotifyEv(
-				*self.wd_paths[wd], wd, self.flags.unpack(mask), cookie, name ))
+			try:
+				evs.append(self.INotifyEv(
+					*self.wd_paths[wd], wd, self.flags.unpack(mask), cookie, name ))
+			except KeyError: pass # after rm_watch or IN_Q_OVERFLOW (wd=-1)
 		return evs
 
 	def __iter__(self):
@@ -230,7 +232,7 @@ class INotify:
 				except StopIteration: break
 
 
-class Logtail(object):
+class Logtail:
 
 	notifier = xattr_db = callback = None
 

@@ -16,7 +16,7 @@ class SSHMuxConfig:
 		-oExitOnForwardFailure=yes -NnT'''.split()
 
 
-class LogMessage(object):
+class LogMessage:
 	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
 	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
 
@@ -27,21 +27,10 @@ class LogStyleAdapter(logging.LoggerAdapter):
 		if not self.isEnabledFor(level): return
 		log_kws = {} if 'exc_info' not in kws else dict(exc_info=kws.pop('exc_info'))
 		msg, kws = self.process(msg, kws)
-		self.logger._log(level, LogMessage(msg, args, kws), (), log_kws)
+		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
 
 get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
 
-
-async def asyncio_wait_or_cancel(
-		loop, task, timeout, default=..., cancel_suppress=None ):
-	if asyncio.iscoroutine(task): task = loop.create_task(task)
-	try: return await asyncio.wait_for(task, timeout)
-	except asyncio.TimeoutError as err:
-		task.cancel()
-		with contextlib.suppress(
-			asyncio.CancelledError, *(cancel_suppress or list()) ): await task
-		if default is ...: raise err
-		else: return default
 
 def retries_within_timeout( tries, timeout,
 		backoff_func=lambda e,n: ((e**n-1)/e), slack=1e-2 ):
@@ -119,7 +108,7 @@ async def mux_negotiate(loop, secret, ident, sock_af, sock_p, host, port, delays
 			if delay:
 				while True:
 					try:
-						response = await asyncio_wait_or_cancel( loop,
+						response = await asyncio.wait_for(
 							proto.responses.get(), max(0, deadline - loop.time()) )
 					except asyncio.TimeoutError: break
 					if response is None:
@@ -167,6 +156,9 @@ def main(args=None, conf=None):
 	parser.add_argument('--ident-rpi', action='store_true',
 		help='Use hash of "Serial" from /proc/cpuinfo as ident.'
 			' Only available on Raspberry Pi boards.')
+	parser.add_argument('--ident-file', metavar='path',
+		help='Read specified file contents as the ident string, stripping spaces.'
+			' E.g. /sys/class/dmi/id/board_serial can be used on x86 platforms, if accessible.')
 	parser.add_argument('--ident-cmd',
 		metavar='shell-cmd',
 		help='Shell command to run to get ident string on stdout.'
@@ -219,6 +211,9 @@ def main(args=None, conf=None):
 					if m: break
 				else: parser.error('Failed to find "Serial : ..." line in /proc/cpuinfo (non-RPi kernel?)')
 				ident = hashlib.blake2b(m.group(1).encode(), key=to_bytes(opts.auth_secret)).digest()
+		elif opts.ident_file:
+			with open(opts.ident_file, 'rb') as src: ident = src.read().strip()
+			ident = hashlib.blake2b(ident, key=to_bytes(opts.auth_secret)).digest()
 		elif opts.ident_cmd:
 			res = subprocess.run(opts.ident_cmd, shell=True, check=True, stdout=subprocess.PIPE)
 			ident = res.stdout.decode().strip()
@@ -245,6 +240,7 @@ def main(args=None, conf=None):
 		host, port_mux, sock_addr,
 		*(sockopt_resolve(pre, n) for pre, n in [
 			('af_', sock_af), ('sock_', sock_t), ('ipproto_', sock_p) ]) )
+	host, port_mux = sock_addr[:2]
 
 	ssh_login = f'{user}@{host}' if user else host
 	retry_delays = retries_within_timeout(opts.attempts+1, opts.timeout)[:-1]
@@ -253,9 +249,7 @@ def main(args=None, conf=None):
 			opts.auth_secret, ident, sock_af, sock_p, host, port_mux, retry_delays ))
 		for sig in 'INT TERM'.split():
 			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), muxer.cancel)
-		try:
-			ssh_port, tun_port = loop.run_until_complete(
-				asyncio_wait_or_cancel(loop, muxer, opts.timeout) )
+		try: ssh_port, tun_port = loop.run_until_complete(asyncio.wait_for(muxer, opts.timeout))
 		except (asyncio.CancelledError, asyncio.TimeoutError) as err:
 			log.debug('mux_negotiate cancelled ({})', err.__class__.__name__)
 			return

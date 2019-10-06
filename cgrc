@@ -1,0 +1,101 @@
+#!/bin/dash
+
+set -e
+check= list= queue= queue_delay=7 queue_timeout= unit= slice=
+
+usage() {
+	bin=${0##*/}
+	echo >&2 "Usage: $bin [-x] { -l | -c | -q [opts] } { -u unit | slice }"
+	echo >&2 "       $bin [-x] [-q [-i N] [-t N]] [-u unit] slice -- cmd [args...]"
+	echo >&2
+	echo >&2 "Run command via 'systemd-run --scope'"
+	echo >&2 "  within specified slice, or inspect slice/scope."
+	echo >&2 "Slice should be pre-defined via .slice unit and starts/stops automatically."
+	echo >&2 "--system/--user mode detected from uid (--system for root, --user otherwise)."
+	echo >&2
+	echo >&2 "Extra options:"
+	echo >&2 "-u name - scope unit name, derived from command basename by default."
+	echo >&2 "   Starting scope with same unit name as already running one will fail."
+	echo >&2 "   With -l/-c list/check opts, restricts check to that scope instead of slice."
+	echo >&2 "-q - wait for all pids in slice/scope to exit before start (if any)."
+	echo >&2 "   -i - delay between checks in seconds, default=${queue_delay}s."
+	echo >&2 "   -t - timeout for -q wait (default=none), exiting with code 36 afterwards."
+	echo >&2 "-l - list all pids within specified slice recursively."
+	echo >&2 "-c - same as -l, but for exit code check: 35 = pids exist, 0 = empty."
+	echo >&2 "-x - 'set -x' debug mode."
+	echo >&2
+	exit ${1:-1}
+}
+
+while getopts xhclqi:t:u: a; do case $a in
+	h) usage 0 ;;
+	c) check=t ;;
+	l) list=t ;;
+	q) queue=t ;;
+	i) queue_delay=$OPTARG ;;
+	t) queue_timeout=$OPTARG ;;
+	u) unit=$OPTARG ;;
+	x) set -x ;;
+	\?) usage ;;
+	esac
+done
+shift $(($OPTIND - 1))
+
+
+[ $(id -u) -ne 0 ] && t=--user || t=--system
+
+cg=
+setcg() {
+	local u
+	[ -z "$cg" ] || return 0
+	[ -z "$slice" ] || { u=$slice; [ "${u%.slice}" != "$u" ] || u="${u}.slice"; }
+	[ -z "$unit" ] || { u=$unit; [ "${u%.scope}" != "$u" ] || u="${u}.scope"; }
+	cg=$(systemctl -q "$t" show -p ControlGroup --value -- "$u")
+}
+
+procs=
+setprocs() {
+	setcg
+	[ -n "$cg" ] || { procs=; return; }
+	procs=$(find /sys/fs/cgroup"$cg" -name cgroup.procs -exec cat '{}' + 2>/dev/null)
+}
+
+
+### list / check
+[ -z "$check" -a -z "$list" ] || {
+	[ -n "$unit" ] || { slice=$1; shift; }
+	[ $# -eq 0 ] || { echo >&2 "ERROR - unrecognized args: $@"; usage; }
+	[ -z "$queue" ] || { echo >&2 "ERROR - -q option not allowed with -l/-c"; usage; }
+	setprocs
+	[ -n "$procs" ] || exit 0
+	[ -z "$check" ] && echo "$procs" || exit 35
+	exit
+}
+
+slice=$1
+[ -n "$slice" ] && shift || { [ -n "$unit" ] || usage 0; }
+
+
+### queue
+[ -z "$queue" ] || {
+	setcg
+	while :; do
+		setprocs
+		[ -n "$procs" ] || break
+		[ -z "$queue_timeout" ] || {
+			queue_timeout=$(($queue_timeout - $queue_delay))
+			[ "$queue_timeout" -gt 0 ] || exit 36
+		}
+		sleep "$queue_delay"
+	done
+	[ -n "$1" ] || exit 0 # wait without command
+}
+
+
+### run
+[ -n "$1" ] || usage 0
+[ "$1" = -- ] || { echo >&2 "ERROR - args where -- should be: $@"; usage; }
+shift; [ -n "$1" ] || { echo >&2 "ERROR - no command specified"; usage; }
+
+[ -n "$unit" ] && u="--unit $unit" || u="--unit ${1##*/}"
+exec systemd-run -q "$t" --scope $u --slice "$slice" -- "$@"
