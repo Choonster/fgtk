@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+
+import os, sys, logging, socket, signal, hashlib as hl
+
+try: import async_dns # https://github.com/gera2ld/async_dns
+except ImportError: async_dns = None # not needed for checker/client
+else:
+	import asyncio
+	from async_dns import (
+		core as adns_core, server as adns_server,
+		resolver as adns_resolver )
+	from async_dns.core import cache as adns_cache
+
+
+class LogMessage:
+	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
+	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
+
+class LogStyleAdapter(logging.LoggerAdapter):
+	def __init__(self, logger, extra=None):
+		super(LogStyleAdapter, self).__init__(logger, extra or {})
+	def log(self, level, msg, *args, **kws):
+		if not self.isEnabledFor(level): return
+		log_kws = {} if 'exc_info' not in kws else dict(exc_info=kws.pop('exc_info'))
+		msg, kws = self.process(msg, kws)
+		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
+
+get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
+
+def log_init(name, debug=False):
+	global log
+	log_fmt = '{name} {levelname:5} :: {message}'
+	if debug: log_fmt = '{asctime} :: ' + log_fmt
+	log_fmt = logging.Formatter(log_fmt, style='{')
+	log_handler = logging.StreamHandler(sys.stderr)
+	log_handler.setLevel(logging.DEBUG if debug else logging.WARNING)
+	log_handler.setFormatter(log_fmt)
+	logging.root.addHandler(log_handler)
+	logging.root.setLevel(0)
+	log = get_logger(f'{name}.main')
+
+
+class HashTestResolver:
+
+	hash_person = 'dnstd.1'.encode()
+
+	@classmethod
+	def hash_fqdn(cls, fqdn, family, key):
+		fqdn_hash = hl.blake2s( fqdn.encode(),
+			key=key or b'', person=cls.hash_person ).digest()
+		addr_len = 4 if family == socket.AF_INET else 16
+		return socket.inet_ntop(family, fqdn_hash[:addr_len])
+
+	def __init__(self, hash_key=None, cache_ttl=180):
+		self.hash_key, self.cache_ttl = hash_key.encode(), cache_ttl
+		self.hash_family = {
+			adns_core.types.A: socket.AF_INET,
+			adns_core.types.AAAA: socket.AF_INET6 }
+
+	async def query_with_cache(self, fqdn, qtype, timeout=None, tick=5):
+		try: return await self.query_hash(fqdn, qtype)
+		except:
+			log.exception('Failed to resove fqdn/qtype: {!r} / {!r}', fqdn, qtype)
+			raise
+
+	async def query_hash(self, fqdn, qtype):
+		# http://www-inf.int-evry.fr/~hennequi/CoursDNS/NOTES-COURS_eng/msg.html
+		fqdn = fqdn.rstrip('.')
+		msg = adns_core.DNSMessage(ra=False)
+		msg.qd.append(adns_core.Record(
+			adns_core.REQUEST, name=fqdn, qtype=qtype))
+		if qtype not in self.hash_family:
+			msg.r = 3 # NXDOMAIN response
+		else:
+			msg.aa = 1 # authoritative answer
+			addr = self.hash_fqdn(fqdn, self.hash_family[qtype], self.hash_key)
+			msg.an.append(adns_core.Record(
+				name=fqdn, data=addr, qtype=qtype, ttl=self.cache_ttl ))
+		return msg, False # msg, from_cache
+
+
+async def bind_resolver(resolver, host, port):
+	loop = asyncio.get_event_loop()
+
+	tcp_server = await loop.create_server(
+		lambda: adns_server.DNSProtocol(resolver), host, port )
+	for sock in tcp_server.sockets:
+		log.debug('Listening on TCP addr {} port {} ', *(sock.getsockname()[:2]))
+
+	host_list = ([host] if isinstance(host, str) else host) if host else ['::']
+	for host_bind in host_list:
+		transport, protocol = await loop.create_datagram_endpoint(
+			lambda: adns_server.DNSDatagramProtocol(resolver),
+			local_addr=(host_bind, port) )
+		log.debug( 'Listening on UDP addr'
+			' {} port {} ', *(transport.get_extra_info('sockname')[:2]) )
+
+
+class HashTestChecker:
+
+	name_noise_len = 12
+
+	def __init__( self, name,
+			af=socket.AF_INET, hash_key=b'',
+			match_any=False, ping_host=None ):
+		import ipaddress, string, random
+		def _name_noise_func():
+			alphabet = string.ascii_lowercase + string.digits
+			return ''.join(random.choice(alphabet) for n in range(self.name_noise_len))
+		self.ip_addr, self.name_noise = ipaddress.ip_address, _name_noise_func
+		self.name, self.af, self.hash_key = name, af, hash_key
+		self.match_any, self.ping_host = match_any, ping_host
+		self.log_check = get_logger(f'dnstd.check.{_name_noise_func()[:4]}')
+
+	def check(self):
+		fqdn = self.name
+		while '@' in fqdn: fqdn = fqdn.replace('@', self.name_noise(), 1)
+		fqdn_addr = self.ip_addr(
+			HashTestResolver.hash_fqdn(fqdn, self.af, self.hash_key) )
+		self.log_check.debug('Expected address for {!r} [af={}]: {}', fqdn, self.af, fqdn_addr)
+		try: addr_list = socket.getaddrinfo(fqdn, 0, self.af)
+		except OSError: addr_list = list()
+		addr_list = set(self.ip_addr(addr[4][0]) for addr in addr_list)
+		match = list(addr == fqdn_addr for addr in addr_list)
+		match = bool(match) and (any(match) if self.match_any else all(match))
+		self.log_check.debug( 'Match result = {}, address list: {}',
+			str(match).lower(), ', '.join(sorted(map(str, addr_list))) )
+		if self.ping_host and not match:
+			match = not self.check_ping()
+			if match:
+				self.log_check.debug( 'Match failure'
+					' discarded due to ping failure (host {!r}', self.ping_host )
+		return match
+
+	def check_ping(self):
+		import subprocess as sp
+		proc = sp.run(['fping', '-q', self.ping_host])
+		return proc.returncode == 0
+
+	def run(self, interval, retries, timeout):
+		import time
+		while True:
+			## Normal routine checks
+			if self.check():
+				time.sleep(interval)
+				continue
+			## retries + timeout recovery-check
+			recover, delay = False, timeout / retries
+			for n in range(1, retries+1):
+				log.debug( 'Retry after failed check [{} / {}]:'
+					' delay={:.1f} recover={}', n, retries, delay, recover )
+				time.sleep(delay)
+				if self.check():
+					if not recover: recover = n
+				elif recover: # flapping state is an instant fail
+					recover = False
+					break
+			if not recover: break
+			else: log.debug('Ignoring transient DNS failure, recovered on retry={}', recover)
+
+
+def main(args=None):
+
+	import argparse, textwrap
+	dd = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
+	fill = lambda s,w=90,ind='',ind_next='  ',**k: textwrap.fill(
+		s, w, initial_indent=ind, subsequent_indent=ind if ind_next is None else ind_next, **k )
+
+	parser = argparse.ArgumentParser(
+		formatter_class=argparse.RawTextHelpFormatter,
+		description=dd('''
+			Script implementing testing DNS daemon that returns
+				responses with addresses generated by hashing queried name,
+				or much simplier client for it to query/check responses.
+			Only handles A and AAAA queries, returns autoritative responses.'''))
+
+	parser.add_argument('-k', '--hash-key', metavar='string', default='', help=dd(f'''
+		Arbitrary string value (32B max) to be used as key=
+			for blake2s hash function to produce address result from queried name.
+		person= value for hash will be {HashTestResolver.hash_person.decode()!r}, first bytes
+			of hash for name will be returned as address after inet_ntop conversion.'''))
+	parser.add_argument('-d', '--debug', action='store_true', help='Verbose operation mode.')
+
+	group = parser.add_argument_group('Client mode options')
+	group.add_argument('name', nargs='?', help=dd('''
+		DNS name to query via system libc resolver, checking reponse
+			address against expected hash value and exit with error code on mismatch.
+		Name can include optional @ character(s) to be
+			replaced by a randomized alphanumeric segment ({n} chars).
+		If this name is specified, script runs in a simple
+			client/check mode instead of starting a persistent daemon.'''\
+		.format(n=HashTestChecker.name_noise_len)))
+	group.add_argument('-q', '--query-type', metavar='A/AAAA', default='A',
+		help='DNS query type to use in client mode - either A or AAAA, case-insensitive.')
+	group.add_argument('--any', action='store_true',
+		help=dd('''
+			Treat any matching address among ones returned by getaddrinfo() as success.
+			Default is to require all returned addresses to match, if there are >1.'''))
+	group.add_argument('-c', '--continuous', metavar='interval:retries:timeout', help=dd(f'''
+		Run DNS checks with specified interval (seconds) until they start failing.
+		Upon first failure, specified number of retries is made within timeout seconds,
+			and unless only last retries are successful, exit with non-zero error code.
+		This mode can be useful to run from e.g. systemd unit, with some on-failure action.'''))
+	group.add_argument('-p', '--ping', metavar='host', help=dd(f'''
+		Ping specified host via "fping" tool after failed dns check,
+			and don't fail if ping fails as well, treating it as an unrelated network failure.'''))
+
+	group = parser.add_argument_group('Daemon mode options')
+	group.add_argument('-b', '--bind',
+		metavar='(host)(:port)', default='127.0.0.1:53',
+		help=dd('''
+			IPv4/IPv6 address and optional TCP+UDP port to bind daemon to.
+			Examples: :53, 1.2.3.4:5533, 127.0.0.1, [::1]:55, fd00::1, localhost:5555
+			Default: %(default)s'''))
+	group.add_argument('--cache-ttl',
+		metavar='n', type=int, default=300,
+		help='Cache TTL value (seconds) in all returned responses. Default: %(default)s')
+
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	log_init('dnstd', opts.debug)
+	logging.getLogger('async_dns.core').handlers.clear() # see async_dns.core.logger
+	for sig in 'int term'.upper().split():
+		signal.signal(getattr(signal, f'SIG{sig}'), lambda sig,frm: sys.exit(0))
+
+	### DNS client mode
+	if opts.name:
+		if opts.query_type.lower() not in ['a', 'aaaa']:
+			parser.error(f'Invalid -q/--query-type value - {opts.query_type}, must be A or AAAA')
+		af = socket.AF_INET if opts.query_type.lower() == 'a' else socket.AF_INET6
+		checker = HashTestChecker(
+			opts.name, af, hash_key=opts.hash_key.encode(),
+			match_any=opts.any, ping_host=opts.ping )
+		if not opts.continuous: return 0 if checker.check() else 53
+		else:
+			interval, retries, timeout = map(float, opts.continuous.split(':', 2))
+			checker.run(interval, round(retries), timeout) # not supposed to finish
+			return 53
+
+	### DNS daemon mode
+	if not async_dns:
+		parser.error('Failed to import async_dns module, which is required to run in daemon mode')
+	bind_addr = adns_core.Address(opts.bind, allow_domain=True)
+	resolver = HashTestResolver(opts.hash_key, opts.cache_ttl)
+	loop = asyncio.get_event_loop()
+	loop.run_until_complete(bind_resolver(resolver, bind_addr.host, bind_addr.port))
+	log.debug('Starting resolver eventloop...')
+	loop.run_forever()
+	log.debug('Finished')
+
+if __name__ == '__main__': sys.exit(main())

@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+import os, sys, socket, re, unicodedata, pathlib as pl
+import math, time, datetime as dt, subprocess as sp
+import urllib.request as ul, urllib.error as ule, urllib.parse as ulp
+
+import feedparser as fp
+
+
+p_err = lambda *a,**k: print('ERROR:', *a, file=sys.stderr, **k) or 1
+
+class adict(dict):
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.__dict__ = self
+
+# Custom accept_header is for github specifically - returns html instead of feed if */* is in there
+conf = adict( version='1.0', socket_timeout=20.0,
+	accept_header='application/atom+xml,application/rdf+xml,'
+		'application/rss+xml,application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2',
+	feed_user_agent='rss-get/{ver} (github.com/mk-fg/fgtk#rss-get) feedparser/{ver_fp}' )
+conf.feed_user_agent = conf.feed_user_agent.format(ver=conf.version, ver_fp=fp.__version__)
+
+
+class FeedError(Exception): pass
+
+def feed_url_check(url):
+	'Return if arg looks like an URL and not just local path.'
+	return re.search(r'^[\w\d]+:', str(url))
+
+def feed_cache(url, path):
+	'Cache feed into path and return it or raise FeedError.'
+	path = pl.Path(path).resolve()
+	if not feed_url_check(url) and pl.Path(url).resolve() == path: return path
+	if path.exists(): return path
+	try:
+		req = ul.Request(url, headers={
+			'User-Agent': conf.feed_user_agent, 'Accept': conf.accept_header })
+		with ul.urlopen(req) as req: status, err, body = req.getcode(), req.reason, req.read()
+	except ule.URLError as err_ex: status, err = 1000, str(err_ex)
+	if status >= 300:
+		if body and len(body) < 250: err = repr(body.decode('utf-8', 'backslashreplace'))
+		raise FeedError(f'Failed to cache feed (status={status}): {url!r} - {err}')
+	path.write_bytes(body)
+	return path
+
+def feed_parse(url):
+	'Return parsed feed with entries for url, raising FeedError on any issues.'
+	feed = fp.parse( url,
+		agent=conf.feed_user_agent, request_headers=dict(Accept=conf.accept_header) )
+	status, bozo, bozo_err = (
+		feed.get(k) for k in ['status', 'bozo', 'bozo_exception'] )
+	fetch_fail = (not status and bozo) or (status or 1000) >= 400
+	if not fetch_fail:
+		if not feed.entries:
+			fetch_fail = bozo = True
+			bozo_err = 'No feed entries'
+	elif not bozo and status is None and not feed_url_check(url): fetch_fail = False # file
+	if fetch_fail:
+		if bozo and not bozo_err: bozo_err = f'[no error msg (bozo={bozo})]'
+		raise FeedError(f'Failed to fetch feed (status={status}): {url!r} - {str(bozo_err).strip()}')
+	return feed
+
+def feed_entry_enclosures(entry, ext_filter=None):
+	'Return filtered list of feed entry enclosure URLs in a consistent type-order, if any.'
+	enc_urls, str_norm = list(), lambda v: unicodedata.normalize('NFKC', v).casefold()
+	if ext_filter: ext_filter = str_norm(ext_filter.strip())
+	for enc in sorted(entry.enclosures or list(), key=lambda enc: enc.get('type') or '-'):
+		enc_href = enc.get('href')
+		if not enc_href: continue
+		if ext_filter:
+			if '/' in ext_filter:
+				enc_mime = enc.get('type')
+				if enc_mime and str_norm(enc_mime.split(';', 1)[0].strip()) != ext_filter: continue
+			else:
+				enc_ext = enc_href.rsplit('.', 1)[-1]
+				if ( len(ext_filter) < 5 and len(enc_ext) < 5
+					and ext_filter != str_norm(enc_ext) ): continue
+		enc_urls.append(enc_href)
+	return enc_urls
+
+def feed_entry_ts(entry):
+	'Return tuple of (raw, parsed) timestamps for entry, latter one in datetime format.'
+	for k in 'published created modified'.split():
+		if not entry.get(k): continue
+		ts, ts_str = entry[f'{k}_parsed'], entry[k]
+		if ts: # not sure if timezone is discarded here, shouldn't matter
+			ts = dt.datetime.fromtimestamp(time.mktime(ts))
+		break
+	else: ts = ts_str = None
+	return ts_str, ts
+
+
+_name_subs = {
+	r'[\\/]': '_', r'^\.+': '_', r'[\x00-\x1f]': '_', r':': '-_',
+	r'<': '(', r'>': ')', r'\*': '+', r'[|!"]': '-', r'[\?\*]': '_',
+	'[\'’]': '', r'\.+$': '_', r'\s+$': '', r'\s': '_', '#': 'N' }
+def name_for_fs( name, fallback=...,
+		_name_subs=list((re.compile(k), v) for k,v in _name_subs.items()) ):
+	if not name and fallback is not ...: return fallback
+	for sub_re, sub in _name_subs: name = sub_re.sub(sub, name)
+	return name
+
+def name_dedup(name, name_set, n=3):
+	suff_n, suff_re, suff_fmt = 1, re.compile(r'\.x' + r'\d'*n + r'$'), f'.x{{:0{n}d}}'
+	while name in name_set:
+		if m := suff_re.search(name): name = name.rsplit(m.group(0))[0]
+		name += suff_fmt.format(suff_n)
+		suff_n += 1
+	name_set.add(name)
+	return name
+
+
+def ts_diff_str( ts, ts0=None, ext=None, sep='',
+		_units=dict( h=3600, m=60, s=1,
+			y=365.25*86400, mo=30.5*86400, w=7*86400, d=1*86400 ) ):
+	delta = abs(
+		(ts - (ts0 or dt.datetime.now()))
+		if not isinstance(ts, dt.timedelta) else ts )
+	res, s = list(), delta.total_seconds()
+	for unit, unit_s in sorted(_units.items(), key=lambda v: v[1], reverse=True):
+		val = math.floor(s / float(unit_s))
+		if not val: continue
+		res.append('{:.0f}{}'.format(val, unit))
+		if len(res) >= 2: break
+		s -= val * unit_s
+	if not res: return 'now'
+	else:
+		if ext: res.append(ext)
+		return sep.join(res)
+
+
+def main(args=None):
+	import argparse
+	parser = argparse.ArgumentParser(
+		description='Parse feed at the URL and print/download enclosure links from it.'
+			' Prints item info by default, unless -n/--num and/or -p/--print-urls opts are specified.'
+			' Downloads to current dir, by passing'
+				' filelist to aria2c with some parallelization options.')
+	parser.add_argument('url', help='URL or file path to grab the feed from.')
+	parser.add_argument('--file', action='store_true',
+		help='Do not try to append https:// prefix to non-URL and non-existent paths.')
+	parser.add_argument('-f', '--file-type', metavar='ext',
+		help='Enclosure file extension or content-type to match in case-insensitive manner.'
+			' Extension gets picked from last slug of the enclosure URLs.'
+			' Examples: audio/mp3, audio/mpeg, mp3, ogg')
+	parser.add_argument('-o', '--out', metavar='file',
+		help='Cache fetched feed to specified file and parse from there.'
+			' If file already exists (cached), it will be used instead of fetching URL.')
+	parser.add_argument('-n', '--num', metavar='n[-m]', action='append',
+		help='Item(s) to print/download. Downloads them by default.'
+			' Can be either an integer item number (1 is latest), or N-M for first-last (inclusive).'
+			' Can be specified multiple times for multiple items/ranges.')
+	parser.add_argument('-p', '--print-urls', action='store_true',
+		help='Print all or selected (by -n/--num) item URLs (one per line) instead of downloading.')
+	parser.add_argument('-t', '--ts-names', action='store_true',
+		help='Use timestamp-derived "YY-mm-dd.HHMM.N.ext" filename, if possible.')
+	parser.add_argument('-v', '--headline-names', action='store_true',
+		help='Derive enclosure filename from item headline, if possible.'
+			' Can be used together with -t/--ts-names to get timestamp + heanline filename.')
+	parser.add_argument('--max-filename-len', type=int, metavar='n', default=90,
+		help='Maximum length for filenames produced by -t and/or -v opts (in characters, not bytes).'
+			' Anything beyond that will be cut and replaced by "--" before dot-extension suffix.'
+			' Default: %(default)s')
+	parser.add_argument('-l', '--list', action='store_true',
+		help='List feed item titles only, one per line.')
+	parser.add_argument('-m', '--list-meta', metavar='fields', default='{e.title}',
+		help='Only with --list - specify output format for each item/line.'
+			' Python str formatting is used, with "e" being feed entry object from feedparser module.'
+			' See https://pythonhosted.org/feedparser/ for info on available RSS/Atom Elements.'
+			' Default: %(default)s')
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	if opts.max_filename_len < 16:
+		parser.error( '-l/--max-filename-len must be at'
+			f' least 16 chars (parsed as {opts.max_filename_len})' )
+
+	ranges = list()
+	for v in opts.num or list():
+		m = re.search(r'^(\d+)(?:-(\d+))?$', v)
+		if not m: parser.error(f'Invalid format for -n/--num option, should be N[-M]: {v!r}')
+		ranges.append((int(m.group(1)) or 1, int(m.group(2) or 0)))
+
+	feed_url = opts.url
+	if ( not opts.file
+			and not feed_url_check(feed_url)
+			and not pl.Path(feed_url).exists() ):
+		feed_url = f'https://{feed_url}'
+	if conf.socket_timeout is not None:
+		socket.setdefaulttimeout(conf.socket_timeout)
+	try:
+		if opts.out: feed_url = feed_cache(feed_url, opts.out)
+		feed = feed_parse(feed_url)
+	except FeedError as err: return p_err(err)
+
+	entries = list(enumerate(feed.entries, 1))
+	ts0, n0, file_urls = None, entries[0][0], dict()
+	for n, e in reversed(entries):
+		enc_urls = feed_entry_enclosures(e, opts.file_type)
+		ts_str, ts = feed_entry_ts(e)
+
+		if not ranges:
+			if not opts.list:
+				ts0, ts_diff = ts, f' +{ts_diff_str(ts - ts0)}' if ts0 else None
+				ts_diff_last = f' -{ts_diff_str(ts)}' if n == n0 else None
+				print(f'--- [{n: 2d}] {e.title}')
+				print(f'    [{ts_str}]{ts_diff or ""}{ts_diff_last or ""}')
+				if url := e.get('link'): print(f'    {url}')
+				for url in enc_urls: print(f'    {url}')
+				print()
+			else: print(opts.list_meta.format(e=e))
+			continue
+
+		else:
+			for a, b in ranges:
+				if n < a: continue
+				if b:
+					if n > b: continue
+				elif n != a: continue
+				break # n in range
+			else: continue
+			if not enc_urls: continue # only care about enclosures here
+
+		url = enc_urls[0]
+		if opts.print_urls: print(url)
+		else: file_urls[url] = adict(title=e.title.strip(), ts=ts, n=n)
+
+	if not file_urls: return
+
+	file_list, name_set = list(), set()
+	for url, meta in file_urls.items():
+		file_list.append(f'{url}\n')
+		name = list()
+		if opts.ts_names and meta.ts:
+			name.append(meta.ts.strftime(f'%y-%m-%d.%H%M.{1000-meta.n:03d}'))
+		if opts.headline_names and meta.title:
+			name.append(f'{name_for_fs(meta.title)}')
+		if not name: continue
+		name = '_-_'.join(name)
+		if len(name) > opts.max_filename_len:
+			name = name[:opts.max_filename_len] + '--'
+		name = name_dedup(name, name_set)
+		ext = pl.Path(ulp.urlparse(url).path).name.rsplit('.')[-1]
+		file_list.append(f'  out={name}.{ext}\n')
+	file_list = ''.join(file_list)
+
+	sp.run(
+		[ 'aria2c', '-s8', '-x8', '-k', '2M', '--console-log-level=warn',
+			'--file-allocation=none', '--input-file', '-', '--user-agent', conf.feed_user_agent ],
+		input=file_list.encode(), check=True )
+
+if __name__ == '__main__': sys.exit(main())

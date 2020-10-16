@@ -1,29 +1,31 @@
 #!/bin/bash
 
+script_info='Ubuntu VM, started from shared virtio-fs by default.'
+ins=1 mem=4G img= dev= iso=
+
+video=( -vga virtio -display gtk,gl=on )
+# video=( -vga std )
+# video=( -display vnc 0 )
+
+[[ "$1" = -r || "$1" = --root || "$UID" -ne 0 ]] || {
+	echo >&2 "ERROR: running as uid=0 but no -r/--root specified"; exit 1; }
+
+[[ "$1" = -i || "$1" = --instance ]] && { ins=$2; shift; shift; }
+[[ "$1" = -m || "$1" = --mem ]] && { mem=$2; shift; shift; }
+[[ "$1" = -q || "$1" = --img ]] && { img=$(realpath "$2"); shift; shift; }
+[[ "$1" = -d || "$1" = --dev ]] && { dev=$(realpath "$2"); shift; shift; }
+[[ "$1" = --iso ]] && { iso=$(realpath "$2"); shift; shift; }
+[[ "$1" = -c || "$1" = --console ]] && { video=( -nographic ); shift; }
+
+root=$(dirname "$BASH_SOURCE")
+dst="$root"/live.dump
+telnet_port=$(( 8200 + $ins ))
+vde_mac=52:54:00:12:34:$(( 60 + $ins ))
+vde_path=~/tmp/vde
+dump_inc= restore= net_only=
+
 
 ### Management
-
-root=/mnt/volatiles/vms
-dst="$root"/ubuntu/live.dump
-telnet_port=8201
-vde_mac=52:54:00:12:34:61
-vde_path=~/tmp/vde
-dump_inc=
-restore=
-net_only=
-img=install
-video=( -nographic )
-fs=
-
-[[ "$1" = -i || "$1" = --img ]] && { img="$2"; shift; shift; }
-[[ "$1" = -f || "$1" = --fs ]] && { fs=t; shift; }
-
-[[ "$1" = -g || "$1" = --graphic ]] && {
-	video=( -vga std )
-	# video+=( -display gtk )
-	# video+=( -display vnc 0 )
-	shift
-}
 
 case "$1" in
 	d|dump)
@@ -64,23 +66,39 @@ EOF
 
 	'') ;;
 	*)
-		echo >&2 "Usage: $0 [ {-i|--img} basename] [-g|--graphic] [-f|--fs] \\"
+		echo >&2 "Usage: $0 [-r|--root] [ {-i|--instance} $ins ] [ {-m|--mem} $mem ] \\"
+		echo >&2 "  [ {-q|--img} file.qcow2 ] [ {-d|--dev} /dev/xyz ] [ --iso image.iso ] [-c|--console] \\"
 		echo >&2 "  [ { d | dump } [path] | { r | restore } [-i] [path] | { m | monitor } | { n | net-only } ]"
+		echo >&2 "(note: ordering of options matters)"
 		cat >&2 <<EOF
 
-Cheatsheet for qemu-img:
-  qemu-img create -f qcow2 install.qcow2 10G
-  qemu-img create -b install.qcow2 -f qcow2 install.qcow2.inc
-  qemu-img commit install.qcow2.inc && rm install.qcow2.inc
+$script_info
 
-Cheatsheet to init new cloudimg:
-  qemu-nbd -c /dev/nbd0 install.qcow2.inc && fsck -a /dev/nbd0 && mount /mnt/nbd
-   && chmod a+r /mnt/nbd/{vmlinuz,initrd.img}
-   && cat ~/.ssh/authorized_keys > /mnt/nbd/root/.ssh/authorized_keys
-   && cat ~/.ssh/authorized_keys > /mnt/nbd/home/ubuntu/.ssh/authorized_keys
-   && touch /mnt/nbd/etc/cloud/cloud-init.disabled
-   && rm -rf /mnt/nbd/etc/systemd/system/cloud-init.target.wants
-   && umount /mnt/nbd && qemu-nbd -d /dev/nbd0
+-- Initial install to qemu-img
+  qemu-img create -f qcow2 install.qcow2 10G
+  ./ubuntu --img install.qcow2 --iso ubuntu/ubuntu-18.04-desktop-amd64.iso
+
+-- ubuntu - add virtiofs.ko to initramfs
+  # needs kernel-5.4+ - https://kernel.ubuntu.com/~kernel-ppa/mainline/
+  echo virtiofs >> /etc/initramfs-tools/modules
+  update-initramfs -k all -c
+
+-- rsync from nbd to shared fs/mount
+  modprobe nbd
+  qemu-nbd -c /dev/nbd0 install.qcow2
+  fsck -a /dev/nbd0p1
+  mount /dev/nbd0p1 /mnt/nbd
+
+  rsync -HaAxXS /mnt/nbd/. fs/
+  : > fs/etc/fstab && rm fs/swapfile
+
+  umount /mnt/nbd
+  qemu-nbd -d /dev/nbd0
+
+-- $(awk '!/^#/ {p=0} /^### virtiofsd/ {
+	p=1; sub(/^#+ ?/,"")} p {sub(/^#+ ?/,"  "); print}' $0)
+
+-- run from virtio-fs: ./ubuntu
 
 EOF
 		exit 1 ;;
@@ -89,88 +107,125 @@ esac
 cd "$root"
 
 
-### Slugfest otherwise
+### Too slow otherwise
 
+err=0
 modprobe kvm || exit 1
-modprobe kvm-intel
-modprobe kvm-amd
+modprobe kvm-intel 2>/dev/null || (( err += 1 ))
+modprobe kvm-amd 2>/dev/null || (( err += 1 ))
+[[ "$err" -lt 2 ]] || { echo >&2 "ERROR: failed to load kvm intel/amd modules"; exit 1; }
 
 
 ### VDE
 
+pid1=$$ pid2=$$
 mkdir -p "$vde_path"
 
-cgrc vm/misc vde_switch\
-	-s "$vde_path"/link.sock\
-	-M "$vde_path"/mgmt.sock &
-pid1=$!
+cgrc -rcu vde && {
+	cgrc -ru vde apps-vm -- vde_switch \
+		-s "$vde_path"/link.sock -M "$vde_path"/mgmt.sock &
+	pid1=$!; }
 
 for n in {0..50}; do
 	[[ -e "$vde_path"/link.sock ]] && break
 	sleep 0.1
 done
-[[ $n -eq 50 ]] && { echo >&2 "vde switch startup failed"; exit 1; }
+[[ $n -lt 50 ]] || { echo >&2 "ERROR: vde switch startup failed"; exit 1; }
 
-cgrc vm/misc sudo vde_plug2tap\
-	-s "$vde_path"/link.sock\
-	vde &
-pid2=$!
+cgrc -rcu vde-tap && {
+	cgrc -ru vde-tap apps-vm -- sudo vde_plug2tap \
+		-s "$vde_path"/link.sock vde &
+	pid2=$!; }
 
 # Add a little delay if vde stuff is just starting
+kill -0 "$pid1" "$pid2" || { echo >&2 "ERROR: vde failed to start"; exit 1; }
 for n in {0..5}; do
-	kill -0 $pid1 $pid2 2>/dev/null || break
+	err=t; ip link show vde &>/dev/null && { err=; break; }
 	sleep 0.1
 done
+[[ -z "$err" ]] || { echo >&2 "ERROR: vde failed to start (no iface)"; exit 1; }
 
 [[ -n "$net_only" ]] && exit 0
 
 
-### Get latest kernel/initrd from vm
+### virtiofsd daemon - has to run as root:
+# # uid=root is to allow access to local uid=root files
+# # Note: SETLKW (fcntl wait for lock) is still not supported.
+# #   Workaround: bind-mount files that require it from /run, see this script for example .service.
+#
+# /usr/lib/qemu/virtiofsd -f \
+#  -o source=$(realpath fs) --socket-path=fs.sock \
+#  -o cache=always,writeback,xattr,flock,posix_lock &
+# chmod 666 fs.sock
 
-# For new cloud images, see cheatsheet in -h/--help output
+## setup-setlkw-hacks.service workaround for SETLKW in dpkg and such
+# [Unit]
+# DefaultDependencies=no
+# After=local-fs.target run.mount
+#
+# # Anything requiring SETLKW on these files should be listed here
+# Before=systemd-sysusers.service
+#
+# [Service]
+# Type=oneshot
+# RemainAfterExit=yes
+#
+# ExecStart=bash -c '\
+# 	mkdir -m700 /run/setlkw ; cd /run/setlkw ;\
+# 	touch dpkg-triggers ; mount -o bind dpkg-triggers /var/lib/dpkg/triggers/Lock ;\
+# 	touch passwd /etc/.pwd.lock ; mount -o bind passwd /etc/.pwd.lock ;\
+# '
+# ExecStop=bash -c '\
+# 	umount -l /var/lib/dpkg/triggers/Lock /etc/.pwd.lock ;\
+# '
+#
+# [Install]
+# WantedBy=multi-user.target
 
-fs_opts=()
-[[ -z "$fs" ]] || {
-	mountpoint -q /mnt/nbd || {
-		modprobe nbd || exit 1
-		sudo qemu-nbd -c /dev/nbd0 ubuntu/"$img".qcow2.inc
-		mount /mnt/nbd || exit 1
-	}
-	rsync -Lt --inplace /mnt/nbd/vmlinuz ubuntu/"$img".kernel \
-		&& rsync -Lt --inplace /mnt/nbd/initrd.img ubuntu/"$img".initramfs \
-		&& umount /mnt/nbd \
-		&& sudo qemu-nbd -d /dev/nbd0 \
-		|| { echo >&2 "Failed to get kernel/initramfs from vm image"; exit 1; }
-	fs_opts+=(
-		-kernel ubuntu/"$img".kernel
-		-initrd ubuntu/"$img".initramfs
-		-append 'root=LABEL=cloudimg-rootfs cloudinit=disabled'
-	)
-}
+
+### img/iso options
+
+root_opts=()
+[[ -z "$img" ]] || root_opts+=(
+	-drive file="$img",if=virtio,aio=native,cache=writeback,cache.direct=on )
+[[ -z "$dev" ]] || root_opts+=( -drive file="$dev",if=virtio,format=raw )
+
+[[ ${#root_opts[@]} -gt 0 ]] || root_opts=(
+	# Fix access to these: chmod a+r fs/boot/*
+	-kernel fs/boot/vmlinuz
+	-initrd fs/boot/initrd.img
+	-append 'root=vio-root rootfstype=virtiofs rw quiet splash'
+
+	-chardev socket,id=vfs-root,path="$root"/fs.sock
+	-device vhost-user-fs-pci,queue-size=1024,chardev=vfs-root,tag=vio-root,cache-size=2G
+	-object memory-backend-file,id=vfs-mem,size=4G,mem-path=/dev/shm,share=on
+	-numa node,memdev=vfs-mem )
+
+[[ -z "$iso" ]] || root_opts+=( -cdrom "$iso" )
 
 
 ### Run qemu
 
 qemu_opts=(
-	-name "$(basename "$0")"
+	-name "$(basename "$0").$ins"
 
-	-m 4096M
 	-rtc base=utc,clock=host
 	-monitor telnet:127.0.0.1:${telnet_port},server,nowait
 	-usb -device usb-kbd -device usb-mouse
-	-net nic,macaddr=${vde_mac},name=vde
+	-net nic,macaddr=${vde_mac},id=vde
 	-net vde,sock="$vde_path"/link.sock
 	-k en-us
 
 	-enable-kvm
 	-cpu host
 	-smp 2
+	-m "$mem"
 	"${video[@]}"
-	"${fs_opts[@]}"
 
-	-drive file=ubuntu/"$img".qcow2.inc,if=virtio,aio=native,cache=writeback,cache.direct=on
-	# -cdrom ubuntu/ubuntu-18.04-desktop-amd64.iso
-	# -drive id=disk,file=ubuntu/"$img".qcow2.inc,if=none -device ahci,id=ahci -device ide-drive,drive=disk,bus=ahci.0
+	"${root_opts[@]}"
+
+	# -device usb-ehci,id=usb,bus=pci.0,addr=0x4
+	# -device usb-host,hostbus=1,hostaddr=3
 )
 
 ulimit -c 0
@@ -178,4 +233,5 @@ export QEMU_AUDIO_DRV=none
 
 [[ -n "$restore" ]] && qemu_opts+=( -incoming "exec:bsdcat $dst" )
 
-exec cgrc vm/misc qemu-system-x86_64 "${qemu_opts[@]}"
+exec cgrc -ru "qemu-ubuntu@$ins" apps-vm \
+	-- qemu-system-x86_64 "${qemu_opts[@]}"

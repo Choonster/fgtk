@@ -2,7 +2,7 @@
 
 from construct import (
 	Struct, Byte, Bytes, Int8ul, Int16ul, Int32ul, Enum, Array,
-	Padding, Embedded, Pass, BitStruct, Flag, Const, ExprAdapter )
+	Padding, Pass, BitStruct, Flag, Const, ExprAdapter )
 from construct.core import StreamError
 
 import itertools as it, operator as op, functools as ft
@@ -42,8 +42,7 @@ Fat32Header = Struct(
 	'physicalDriveNumber_old' / Byte,
 	'bootSectorSignature' / Const(b'\x55\xaa') )
 
-BootSector = Struct(
-	Embedded(Fat32Header),
+BootSector = ( Fat32Header +
 	Padding(lambda ctx: ctx.sectorSize - Fat32Header.sizeof()) )
 
 FatEntry = Enum(
@@ -112,20 +111,20 @@ LFNEntry = Struct(
 
 
 def PreDataRegion(fsinfo=False, fats=True):
-	entries = [Embedded(BootSector)]
+	entries = BootSector
 	reserved_padding = Padding(lambda ctx: (ctx.reservedSectorCount - 1) * ctx.sectorSize)
 	if fsinfo:
-		entries.append(Padding(lambda ctx: (ctx.fsInfoSectorNo - 1) * ctx.sectorSize))
+		entries += Padding(lambda ctx: (ctx.fsInfoSectorNo - 1) * ctx.sectorSize)
 		# https://en.wikipedia.org/wiki/File_Allocation_Table#FS_Information_Sector
-		# entries.append(Embedded(FSInfoSector('fsInfoSector')))
+		# entries += FSInfoSector('fsInfoSector')
 		reserved_padding = Padding(
 			lambda ctx: (ctx.reservedSectorCount - ctx.fsInfoSectorNo - 1) * ctx.sectorSize )
 		raise NotImplementedError
 	if fats:
-		entries.append(reserved_padding)
-		entries.append('fats' / Array( lambda ctx: ctx.fatCount,
-			Array(lambda ctx: ctx.sectorsPerFat_large * ctx.sectorSize // FatEntry.sizeof(), FatEntry) ))
-	return Struct(*entries)
+		entries += reserved_padding
+		entries += 'fats' / Array( lambda ctx: ctx.fatCount,
+			Array(lambda ctx: ctx.sectorsPerFat_large * ctx.sectorSize // FatEntry.sizeof(), FatEntry) )
+	return entries
 
 
 class File:
@@ -291,7 +290,8 @@ class FatFs(Directory):
 		log.error('  assuming %s', res)
 		return res
 
-	def get_chain(self, clidx):
+	def get_chain(self, clidx=None):
+		if clidx is None: clidx = self.firstCluster
 		res, clidx_start = [], clidx
 		while clidx < 0xffffff8: # last cluster is 0xffffff8-0xfffffff
 			assert isinstance(clidx, int), clidx
@@ -562,7 +562,7 @@ def main(args=None):
 			Default action, if no other options are specified.''')
 	group.add_argument('-s', '--shuffle', action='store_true',
 		help='''
-			Shuffle entries in specified directory.'
+			Shuffle entries in specified directory.
 			This reads all direntries there and writes them back in randomized order.
 			Intended for stupid devices (e.g. mp3 players) which rely on that.''')
 	group.add_argument('-o', '--order', action='store_true',
@@ -640,6 +640,7 @@ def main(args=None):
 		elif not path.startswith(os.sep):
 			parser.error( 'Path argument must begin with'
 				' slash (for typo-safety reasons): {!r}'.format(path) )
+		if path == '.': path = '/'
 
 		src_mode = 'rb' if not opts.dry_run and opts.list else 'rb+'
 		with open(dev, src_mode) as src:

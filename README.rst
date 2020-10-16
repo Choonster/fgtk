@@ -106,6 +106,19 @@ Example - run "make" on any change to ``~user/hatch/project`` files::
 .. _fatrace: https://launchpad.net/fatrace
 .. _fanotify: http://lwn.net/Articles/339253/
 
+fatrace-run
+'''''''''''
+
+Convenience wrapper around fatrace_ like fatrace-pipe above,
+but intended to only filter by path prefix and run command on specified event(s).
+
+For example, to e.g. reload nginx when anything under its config dir/subdirs changes::
+
+  # fatrace-run -p /etc/nginx -f 'WD<>' -- pkill -HUP -F /run/nginx.pid
+
+(-p to also echo events to stdout, "-f W" will filter file writes,
+D - deletions, <> - renames)
+
 findx
 '''''
 
@@ -155,6 +168,26 @@ user acc in a main namespace.
 
 For long-term access (e.g. for some daemon), there probably are better options
 than such bindfs hack - e.g. bind-mounts, shared uids/gids, ACLs, etc.
+
+fast-disk-wipe
+''''''''''''''
+
+Very simple "write 512B, skip N * 512B, repeat" binary for wiping some block
+device in a hurry.
+
+Idea is not to erase every trace of data or to hide it, but just to make files
+probabilistically unusable due to such junk blocks all over the place.
+
+With low-enough intervals it should also corrupt filesystem pretty badly,
+making metadata hard to access.
+
+Fast loop of 512B writes to a device directly will likely hang that binary until
+it's done, as that's how such direct I/O seem to work on linux.
+
+Writes only stop when write() or lseek() starts returning errors, so using this
+on some extendable file will result in it eating up all space available to it.
+
+See head of the file for build and usage info.
 
 
 
@@ -292,6 +325,7 @@ Jinja2 env for template has following filters and values:
 
   | Can be used as a reliable dns/network-independent names.
   | ``--hosts-opts`` cli option allows some tweaks wrt how that file is parsed.
+  | See also HostsNode object for various helper methods to lookup those.
 
 - ``iface`` - current network interfaces and IPv4/IPv6 addresses assigned there
   (fetched from libc getifaddrs via ctypes).
@@ -355,10 +389,18 @@ process.
 term-pipe
 '''''''''
 
+Py3 script with various terminal input/output piping helpers and tools.
+
+Has multiple modes for different use-cases, collected in same script mostly
+because they're pretty simple and not worth remembering separate ones.
+
+out-paste
+`````````
+
 Disables terminal echo and outputs line-buffered stdin to stdout.
 
-Use-case is grepping through huge multiline strings (e.g. webpage source) pasted
-into terminal, i.e.::
+Example use-case can be grepping through huge multiline strings
+(e.g. webpage source) pasted into terminal, i.e.::
 
   % term-pipe | g -o '\<http://[^"]\+'
 
@@ -370,6 +412,32 @@ into terminal, i.e.::
 
 There are better tools for that particular use-case, but this solution is
 universal wrt any possible input source.
+
+shell-notify
+````````````
+
+Filter for screen/tmux/script output to send desktop notification (using sd-bus
+lib) when shell prompt is detected on stdin, to enable when some long job is
+running for example, so that you'd get notified immediately when it's done.
+
+Shell prompt detection is done via simple regexp, highly specific to my prompt(s)
+and use-case(s), so might need tweaks in the code for different ones.
+-l/--log option can be useful when doing that - will print all input lines
+(with proper repr() wrapping), which can then be checked for desired patterns
+and tested against new detection regexps as necessary.
+
+Example use in tmux.conf::
+
+  bind-key r pipe-pane 'exec term-pipe shell-notify'
+  bind-key R pipe-pane
+
+Should make "r" key (after prefix key) enable notifications and "shift+r" disable them.
+Use "pipe-pane -o" to toggle this via same key instead.
+
+"exec ..." command there is passed to shell, so to debug errors after any
+significant changes, something like "2>/tmp/errors.log" can be added at the end.
+
+Check options of this subcommand for rate-limiting and some other tweaks.
 
 yaml-to-pretty-json
 '''''''''''''''''''
@@ -450,6 +518,23 @@ checks there.
 Use-case is to easily produce single-file webapps or pages to pass around (or
 share somewhere), e.g. some d3-based interactive chart page or an html report
 with a few embedded images.
+
+someml-indent
+'''''''''''''
+
+Simple and dirty regexp + backreferences something-ML (SGML/HTML/XML) parser to
+indent tags/values in a compact way without messing-up anything else in there.
+
+I.e. non-closed tags are FINE, something like <@> doesn't cause parser to
+explode, etc.
+
+Does not add any XML headers, does not mangle (or "canonize") tags/attrs/values
+in any way, except for stripping/adding those spaces.
+
+Kinda like BeautifulSoup, except not limited to html and trivial enough so that
+it can be trusted not to do anything unnecessary like stuff mentioned above.
+
+For cases when ``xmllint --format`` fail and/or break such kinda-ML-but-not-XML files.
 
 entropy
 '''''''
@@ -728,7 +813,8 @@ Both get started/stopped by systemd on as-needed basis.
 
 Tool also allows to check or list pids within scopes/slices with -c/-l options
 (to e.g. check if named scope already started or something running in a slice),
-as well as wait on these (-q option, can be used to queue/run commands in sequence).
+as well as waiting on these (-q option, can be used to queue/run commands in sequence)
+and manipulating associated cgroup limits easily (-v option).
 
 Run without any args/opts or with -h/--help to get more detailed usage info.
 
@@ -1287,6 +1373,39 @@ Other options allow for picking number of words and sanity-checks like min/max l
 
 .. _Diceware-like: https://en.wikipedia.org/wiki/Diceware
 
+hhash
+'''''
+
+Produces lower-entropy "human hash" phrase consisting of aspell english
+dictionary words for input arg(s) or data on stdin.
+
+It works by first calculating BLAKE2 hash of input string/data via libsodium_,
+and then encoding it using consistent word-alphabet, exactly like something like
+base32 or base64 does.
+
+Example::
+
+  % hhash -e AAAAC3NzaC1lZDI1NTE5AAAAIPh5/VmxDwgtJI0HiFBqZkbyV1I1YK+2DVjGjYydNp5o
+  allan avenues regrade windups flours
+  entropy-stats: word-count=5 dict-words=126643 word-bits=17.0 total-bits=84.8
+
+Here -e is used to print entropy estimate for produced words.
+
+Note that resulting entropy values can be fractional if word-alphabet ends up
+being padded to map exactly to N bits (e.g. 17 bits above), so that words in it
+can be repeated, hence not exactly 17 bits of distinct values.
+
+Written in OCAML, linked against libsodium_ (for BLAKE2 hash function) via small
+C glue code, build with::
+
+  % ocamlopt -o hhash -O2 unix.cmxa str.cmxa -cclib -lsodium hhash.ml hhash.ml.c
+  % strip hhash
+
+Caches dictionary into a ~/.cache/hhash.dict (-c option) on first run to produce
+consistent results on this machine. Updating that dictionary will change outputs!
+
+.. _libsodium: https://libsodium.org/
+
 urlparse
 ''''''''
 
@@ -1296,51 +1415,6 @@ command on two outputs) with another URL.
 
 No more squinting at some huge incomprehensible ecommerce URLs before scraping
 the hell out of them!
-
-graphite-scratchpad
-'''''''''''''''''''
-
-Tool to load/dump stored graphite_ graphs through formats easily editable by
-hand.
-
-For example, creating even one dashboard there is a lot of clicky-clicks, and 10
-slightly different dashboards is mission impossible, but do
-``graphite-scratchpad dash:top`` (loaded straight from graphite db) and you
-get::
-
-  name: top
-
-  defaultGraphParams:
-    from: -24hours
-    height: 250
-    until: -20minutes
-    width: 400
-
-  ...
-
-  graphs:
-    - target:
-        - *.memory.allocation.reclaimable
-    - target:
-        - *.disk.load.sdb.utilization
-        - *.disk.load.sda.utilization
-      yMax: 100
-      yMin: 0
-    - target:
-        - *.cpu.all.idle
-      yMax: 100
-      yMin: 0
-  ...
-
-That's all graph-building data in an easily readable, editable and parseable
-format (yaml, nicely-spaced with pyaml_ module).
-
-Edit that and do ``graphite-scratchpad yaml dash:top < dash.yaml`` to replace
-the thing in graphite db with an updated thing. Much easier than doing anything
-with GUI.
-
-.. _graphite: http://graphite.readthedocs.org/
-.. _pyaml: https://github.com/mk-fg/pretty-yaml
 
 ip-ext
 ''''''
@@ -1480,55 +1554,6 @@ localhost:1080``) link::
 
   % openssl-fingerprint google.com localhost:1080
   SHA1 Fingerprint=A8:7A:93:13:23:2E:97:4A:08:83:DD:09:C4:5F:37:D5:B7:4E:E2:D4
-
-rrd-sensors-logger
-''''''''''''''''''
-
-Daemon script to grab data from whatever sensors and log it all via rrdtool.
-
-Self-contained, configurable, handles clock jumps and weirdness (for e.g. arm
-boards that lack battery-backed RTC), integrates with systemd (Type=notify,
-watchdog), has commands to easily produce graphs from this data (and can serve
-these via http), print last values.
-
-Auto-generates rrd schema from config (and filename from that), inits db, checks
-for time jumps and aborts if necessary (rrdtool can't handle these, and they are
-common on arm boards), cleans up after itself.
-
-Same things can be done by using rrdtool directly, but it requires a ton of
-typing for graph options and such, while this script generates it all for you,
-and is designed to be "hands-off" kind of easy.
-
-Using it to keep track of SoC sensor readings on boards like RPi (to see if
-maybe it's time to cram a heatsink on top of one or something), for more serious
-systems something like collectd + graphite might be a better option.
-
-Command-line usage::
-
-  % rrd-sensors-logger daemon --http-listen --http-opts-allow &
-
-  % rrd-sensors-logger print-conf-example
-  ### rrd-sensors-logger configuration file (format: YAML)
-  ### Place this file into ~/.rrd-sensors-logger.yaml or specify explicitly with --conf option.
-  ...
-
-  % rrd-sensors-logger print-last
-  cpu.t: 30.22513627594576
-  gpu.t: 39.44316309653439
-  mb_1.t: 41.77566666851852
-  mb_2.t: 41.27842380952381
-
-  % curl -o graph.png http://localhost:8123/
-  % curl -o graph.png http://localhost:8123/t
-  % curl -o graph.png 'http://localhost:8123/t/width:+1900,height:+800'
-  % curl -o graph.png 'http://localhost:8123//start:+-2d,logarithmic:+true,title:+my+graph'
-
-  % feh $(rrd-sensors-logger graph t -o 'start: -3h')
-
-See top of the script for yaml config (also available via "print-conf-example")
-and systemd unit file example ("print-systemd-unit" command).
-
-Uses: layered-yaml-attrdict-config (lya), rrdtool.
 
 nsh
 '''
@@ -1824,6 +1849,171 @@ Example snippet for sending update packets::
 
 .. _nsd: https://wiki.alpinelinux.org/wiki/Setting_up_nsd_DNS_server
 
+dns-test-daemon
+'''''''''''''''
+
+Python3 + `async_dns`_ authoritative DNS resolver daemon to return
+hashed-name results for testing DNS resolver operation.
+
+For example::
+
+  % ./dns-test-daemon -k hash-key -b 127.0.0.1:5533 &
+  % dig -p5533 @127.0.0.1 aaaa test.com
+  ...
+  test.com. 300 IN AAAA eb5:7823:f2d2:2ed2:ba27:dd79:a33e:f762
+  ...
+
+Here, for AAAA "test.com" query, script returned first 16 bytes of
+"blake2s(test.com, key=hash-key, person=dnstd.1)" hash digest as a reponse
+(converted to address via inet_ntop).
+
+Its purpose is to be run as an authoritative resolver for some stub zone
+forwarded to it, e.g. "\*.test.mydomain.com", and then be able to make sure that
+any local DNS resolver works by querying e.g. "12345.test.mydomain.com" and
+checking that resulting address hash matches expected value (dependent only on
+queried name, hash key and that hardcoded person= string).
+
+To run script in tester-client mode, simply pass it a name to test, along with
+same -k/--hash-key parameter as for daemon on the other end, e.g.::
+
+  % ./dns-test-daemon -k hash-key random-stuff.test.mydomain.com
+  % ./dns-test-daemon -k hash-key --debug @.test.mydomain.com
+
+It will exit with non-zero code if result is missing or doesn't match expected
+value in any way.
+
+Does not import/use or require asyncio and async_dns modules in client mode.
+
+Its -c/--continuous mode can be used together with systemd to kick/restart
+unreliable resolver daemon (e.g. unbound) when it hangs or fails in other ways::
+
+  [Service]
+  Type=exec
+  User=dnstd
+  ExecStart=dns-test-daemon -c 150:6:100 -p 1.1.1.1 @.test.mydomain.com
+  ExecStopPost=+bash -c '[[ "$$SERVICE_RESULT" = success ]] || systemctl try-restart unbound'
+
+  # Using RestartForceExitStatus=53 should prevent unbound restarts on script bugs
+  RestartForceExitStatus=53
+  RestartSec=5min
+
+  [Install]
+  WantedBy=multi-user.service
+
+Note ``-p 1.1.1.1`` ping-option there to avoid restarting the daemon if whole
+network is down, which runs "fping" to check that on detected DNS failures.
+
+.. _async_dns: https://github.com/gera2ld/async_dns
+
+nginx-access-log-stat-block
+'''''''''''''''''''''''''''
+
+Python3/ctypes script to be used alongside nginx-stat-check_ module, reliably
+tailing any kind of access.log-like file(s) where first (space-separated) field
+is IP address and creating files with name corresponding to these in specified
+db_dir.
+
+nginx-stat-check module then allows to use ``stat_check /some/db_dir/$remote_addr;``
+in nginx.conf to return 403 for all addresses processed in this way.
+
+Created files are automatically renamed and cleaned-up after specified
+unblock/forget-timeouts and block-timeout either get extended or multiplied by
+specified k value (2x default) on repeated blocks after expiry.
+
+Intended use it to block stupid bots and whatever spammers that don't care about
+robots.txt when these access some honeypot-file on nginx level (with proper 403
+on specific URL paths), which normally should never be requested.
+
+I.e. bots that are stupidly re-indexing giant file dumps or whatever dynamic
+content every N minutes.
+
+Example nginx.conf snippet::
+
+  load_module /usr/lib/nginx/modules/ngx_http_stat_check.so;
+  log_format stat-block '$remote_addr :: $time_iso8601 "$http_referer" "$http_user_agent"';
+  ...
+
+  location = /distro/package/mirror/open-and-get-banned.txt {
+    alias /srv/pkg-mirror/open-and-get-banned.txt;
+    access_log /var/log/nginx/bots.log stat-block;
+  }
+
+  location /distro/package/mirror {
+    alias /srv/pkg-mirror;
+    autoindex on;
+    stat_check /tmp/stat-block/$remote_addr;
+  }
+
+And run script to populate ``/tmp/stat-block/`` path from bots.log::
+
+  % ./nginx-access-log-stat-block --debug /tmp/stat-block/ /var/log/nginx/bots.log
+
+Check -h/--help output for default block-timeout and such values.
+
+Uses inotify to tail files via ctypes, detects log rotation but NOT truncation
+(use with append/remove-only logs), can tail multiple wildcard-matching files in
+a directory, closes opened/tailed logs after timeout.
+
+Always opens files at the end, so can loose a line or two due to that, which is
+fine for intended purpose (bots spam requests anyway).
+
+.. _nginx-stat-check: https://github.com/mk-fg/nginx-stat-check
+
+hashname
+''''''''
+
+Script to add base32-encoded content hash to filenames.
+
+For example::
+
+  % hashnames -p *.jpg
+
+  wallpaper001.jpg -> wallpaper001.kw30e7cqytmmw.jpg
+  wallpaper893.jpg -> wallpaper893.vbf0t0qht4dd0.jpg
+  wallpaper895.jpg -> wallpaper895.q5mp0j95bxbdr.jpg
+  wallpaper898.jpg -> wallpaper898.c9g9yeb06pdbj.jpg
+
+For collecting files with commonly-repeated names into some dir, like random
+"wallpaper.jpg" or "image.jpg" images above from the internets.
+
+Use -h/--help for info on more useful options.
+
+sys-wait
+''''''''
+
+Bash script to check and wait for various system conditions, processes or
+thresholds like load average or PSI values.
+
+Random examples::
+
+  % sys-wait -l 3 && run-less-heavy-task
+  % sys-wait --load15 5 && run-next-heavy-task
+  % sys-wait --pgrep '-x rsync' && run-other-rsync
+
+Helps to avoid writing those annoyingly-common ``while :; do some-check ||
+break; sleep 60; done; run-other-stuff`` when something heavy/long is already
+running and you just don't have the heart to break and reschedule it properly.
+
+yt-feed-to-email
+''''''''''''''''
+
+Python3 + feedparser_ RSS-to-email notification script for YouTube RSS feeds.
+
+Can process OPML of current YT subscriptions
+(from https://www.youtube.com/subscription_manager?action_takeout=1 )
+or work with one-per-line list of channel/video RSS feed links.
+
+Remembers last feed state(s) via auto-rotating log, uses EWMA_ to calculate
+delay between checks based on feed update interval.
+
+Useful to keep track of YT channel updates via read/unread status in some
+dedicated mailbox folder, and click-open video links from there in mpv,
+like one could before Aug 2020 when google decided to stop sending all update
+notification emails on that platform.
+
+.. _feedparser: https://pythonhosted.org/feedparser/
+.. _EWMA: https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average
+
 
 
 [dev] Dev tools
@@ -1831,29 +2021,15 @@ Example snippet for sending update packets::
 
 Minor things I tend to use when writing code and stuff.
 
-tabs_filter
-^^^^^^^^^^^
+indent-replace
+^^^^^^^^^^^^^^
 
-My secret weapon in tabs-vs-spaces holywar.
+Very simple script to replace tabs with spaces and back, doing minor sanity
+checks and printing files with replacements to stdout.
 
-In my emacs, tab key always inserts "", marking spaces as a bug with
-develock-mode. This script transparently converts all indent-tabs into spaces
-and back, designed to be used from git content filters, and occasionally by
-hand.
-
-.git/config::
-
-  [filter "tabs"]
-    clean = tabs_filter clean %f
-    smudge = tabs_filter smudge %f
-
-.git/info/attributes or .gitattributes::
-
-  *.py filter=tabs
-  *.tac filter=tabs
-
-Not sure why people have such strong opinions on that trivial matter,
-but I find it easier never to mention that I use such script ;)
+Goal is to avoid all inconvenience with handling unfamiliar indent types in
+editor, and just have it setup for strictly one of those, doing translation
+before/after commits manually.
 
 golang_filter
 ^^^^^^^^^^^^^
@@ -2153,12 +2329,8 @@ Helpers for more interactive (client) machine, DE and apps there.
 [desktop/uri_handlers]
 ^^^^^^^^^^^^^^^^^^^^^^
 
-Scripts to delegate downloads from firefox to a more sensible download managers.
-
-Mostly I use remote mldonkey for ed2k and regular http downloads and rtorrent /
-transmission for bittorrent (with some processing of .torrent files to drop
-long-dead trackers from there and flatten tracker tiers, for reasons I blogged
-about in some distant past).
+Scripts to delegate downloads from browser to more sensible download managers,
+like passing magnet: links to transmission, or processing .torrent files.
 
 
 [desktop/media]
@@ -2589,32 +2761,6 @@ Uses plumbum_ to call "rsync --inplace" (faster than "cp" in most cases) and
 .. _3k files: http://ocremix.org/torrents/
 .. _plumbum: http://plumbum.readthedocs.org
 
-link
-''''
-
-ssh wrapper to save time on typing something like ``exec ssh -X -A -p3542
-root@1.2.3.4 'screen -DR'``, especially for N remote hosts.
-
-Also has the ability to "keep trying to connect", useful (to me, at least) for
-crappy shared-hosting servers, where botnets flood ssh with slowloris-like
-attacks on it's authentication, exceeding limit on unauthorized connections in
-sshd.
-
-e_config_backup
-'''''''''''''''
-
-Yapps2_-based (grammar as-is in \*.g file) parser script for Enlightenment (E17)
-config file (doing eet-decoding beforehand) for the purposes of it's backup in
-`de-setup git repo`_ alongside other DE-related configuration.
-
-Whole purpose of decoding/encoding dance is to sort the sections (which E orders
-at random) and detect/filter-out irrelevant changes like remembered window
-positions or current (`auto-rotated`_) wallpaper path.
-
-.. _Yapps2: https://github.com/mk-fg/yapps
-.. _de-setup git repo: https://github.com/mk-fg/de-setup
-.. _auto-rotated: http://desktop-aura.sourceforge.net/
-
 vfat_shuffler
 '''''''''''''
 
@@ -2861,10 +3007,77 @@ Safe wrt NUL-bytes, but should not be used without -x/--verbatim on multi-byte
 non-utf-8 encodings (where \\n byte can mean something else), and won't strip
 any weird non-ascii utf-8 spaces.
 
-Has -d/--slashes-to-dots option to copy paths as dotted prefixes, with same
-caveats as above.
+Has -d/--slashes-to-dots and -t/--tabs-to-spaces options to process output in
+various ways - see -h/--help output for more info.
 
 .. _xclip: https://github.com/astrand/xclip
+
+rss-get
+'''''''
+
+Python3/feedparser script to download items attached to RSS feeds fast using
+aria2_ tool, or just printing the info/URLs.
+
+Example use can be grabbing some range of podcast mp3s from a feed URL.
+
+aria2 allows for parallel multi-chunk downloads of throttled items, and wrapper
+script has option to pass it destination filenames according to item date/time
+instead of the usual nonsensical, incoherent and inconsistent names authors seem
+to inevitably assign to files on a regular-content feeds.
+
+qr
+'''
+
+Bash wrapper around qrencode_ to assemble and display QR-encoded strings in
+a fullscreen feh_ window, cleaning-up after itself afterwards.
+
+For example, to pass WiFi AP data to any smartphone that way:
+``qr -s myssid -p some-passphrase``
+
+Has bunch of other options for different common use-cases.
+
+.. _qrencode: https://fukuchi.org/works/qrencode/index.html.en
+.. _feh: https://feh.finalrewind.org/
+
+gtk-color-calc
+''''''''''''''
+
+CLI tool to calculate color values and print/convert them in various ways.
+
+Initially made to convert any kind of `GTK3 CSS color specs`_ to an actual color
+value, e.g. "mix(#eee, shade(olive, 0.8), 0.9)" -> #6b6b21.
+
+And for now that's the main use of it, as that CSS spec allows to mix and shade
+already, plan is to extend it later with any extra math as needed.
+
+Prints resulting color back in all possible formats, including HSL and CIE
+L\*a\*b\*, requires python3/gtk3 to run.
+
+.. _GTK3 CSS color specs: https://developer.gnome.org/gtk3/stable/chap-css-overview.html
+
+filetag
+'''''''
+
+Command-line python script to scan files for tagging based on paths or filename
+extensions (e.g. tag \*.py with "py"), script shebangs or magic bytes (binary header).
+
+Simplier and more performant replacement for earlier codetag_ tool, using gdbm
+db for more efficient tag storage and lookups instead of tmsu_.
+
+Allows for fast "sum of products" DNF queries, i.e. fairly arbitrary tag
+combinations, just convert them to DNF from whatever algebraic notation
+(e.g. via `dcode.fr calculator`_).
+
+List of tags and tagging criteria are hardcoded, currently mostly code-oriented,
+but should be trivial to expand with additional regexps for pretty much anything.
+
+My main use-case is to quickly lookup and grep all python files on the machine,
+to find where I already implemented something familiar just couple days ago and
+forgot already :)
+
+.. _codetag: https://github.com/mk-fg/codetag
+.. _tmsu: https://tmsu.org/
+.. _dcode.fr calculator: https://www.dcode.fr/boolean-expressions-calculator
 
 
 
@@ -3053,11 +3266,105 @@ suitable to boot and log into with e.g. ``systemd-nspawn -bn -M buildbot-32``.
 
 
 
-[scraps]
-~~~~~~~~
+[metrics] Charts and metrics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Misc prefabs and *really* ad-hoc scripts,
-mostly stored here as templates to make something out of later.
+Tools for working with various time-series databases and metrics-monitoring
+systems - collection, aggregation, configuration, graphs, etc.
+
+rrd-sensors-logger
+^^^^^^^^^^^^^^^^^^
+
+Daemon script to grab data from whatever sensors and log it all via rrdtool.
+
+Self-contained, configurable, handles clock jumps and weirdness (for e.g. arm
+boards that lack battery-backed RTC), integrates with systemd (Type=notify,
+watchdog), has commands to easily produce graphs from this data (and can serve
+these via http), print last values.
+
+Auto-generates rrd schema from config (and filename from that), inits db, checks
+for time jumps and aborts if necessary (rrdtool can't handle these, and they are
+common on arm boards), cleans up after itself.
+
+Same things can be done by using rrdtool directly, but it requires a ton of
+typing for graph options and such, while this script generates it all for you,
+and is designed to be "hands-off" kind of easy.
+
+Using it to keep track of SoC sensor readings on boards like RPi (to see if
+maybe it's time to cram a heatsink on top of one or something), for more serious
+systems something like collectd + graphite might be a better option.
+
+Command-line usage::
+
+  % rrd-sensors-logger daemon --http-listen --http-opts-allow &
+
+  % rrd-sensors-logger print-conf-example
+  ### rrd-sensors-logger configuration file (format: YAML)
+  ### Place this file into ~/.rrd-sensors-logger.yaml or specify explicitly with --conf option.
+  ...
+
+  % rrd-sensors-logger print-last
+  cpu.t: 30.22513627594576
+  gpu.t: 39.44316309653439
+  mb_1.t: 41.77566666851852
+  mb_2.t: 41.27842380952381
+
+  % curl -o graph.png http://localhost:8123/
+  % curl -o graph.png http://localhost:8123/t
+  % curl -o graph.png 'http://localhost:8123/t/width:+1900,height:+800'
+  % curl -o graph.png 'http://localhost:8123//start:+-2d,logarithmic:+true,title:+my+graph'
+
+  % feh $(rrd-sensors-logger graph t -o 'start: -3h')
+
+See top of the script for yaml config (also available via "print-conf-example")
+and systemd unit file example ("print-systemd-unit" command).
+
+Uses: layered-yaml-attrdict-config (lya), rrdtool.
+
+graphite-scratchpad
+^^^^^^^^^^^^^^^^^^^
+
+Tool to load/dump stored graphite_ graphs through formats easily editable by
+hand.
+
+For example, creating even one dashboard there is a lot of clicky-clicks, and 10
+slightly different dashboards is mission impossible, but do
+``graphite-scratchpad dash:top`` (loaded straight from graphite db) and you
+get::
+
+  name: top
+
+  defaultGraphParams:
+    from: -24hours
+    height: 250
+    until: -20minutes
+    width: 400
+
+  ...
+
+  graphs:
+    - target:
+        - *.memory.allocation.reclaimable
+    - target:
+        - *.disk.load.sdb.utilization
+        - *.disk.load.sda.utilization
+      yMax: 100
+      yMin: 0
+    - target:
+        - *.cpu.all.idle
+      yMax: 100
+      yMin: 0
+  ...
+
+That's all graph-building data in an easily readable, editable and parseable
+format (yaml, nicely-spaced with pyaml_ module).
+
+Edit that and do ``graphite-scratchpad yaml dash:top < dash.yaml`` to replace
+the thing in graphite db with an updated thing. Much easier than doing anything
+with GUI.
+
+.. _graphite: http://graphite.readthedocs.org/
+.. _pyaml: https://github.com/mk-fg/pretty-yaml
 
 gnuplot-free
 ^^^^^^^^^^^^
@@ -3069,6 +3376,149 @@ Mostly a reminder of how to use the thing and what one can do with it.
 There's more info on it in `gnuplot-for-live-last-30-seconds`_ blog post.
 
 .. _gnuplot-for-live-last-30-seconds: http://blog.fraggod.net/2015/03/25/gnuplot-for-live-last-30-seconds-sliding-window-of-free-memory-data.html
+
+d3-line-chart-boilerplate
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Boilerplate `d3.js`_ page for basic line chart to plot arbitrary JS function
+outputs or data array with axii, grid, mouseover datapoint tooltips and such.
+
+Useful when for a quick chart to figure out some data or function output,
+or make it into a useful non-static link to someone,
+and don't want to deal with d3-v3/coding-style/JS diffs from bl.ocks.org.
+
+.. _d3.js: http://d3js.org/
+
+d3-temp-rh-sensor-tsv-series-chart
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+`d3.js`_-based ES6 graphing app for time-series data from rather common
+temperature (t) and relative humidity (rh) sensors (DHT22, sht1x, etc) in tsv
+(tab-separated-values) files with [iso8601-ts, t, rh] fields.
+
+Can be used directly via gh-pages: `d3-temp-rh-sensor-tsv-series-chart.html`_
+
+Bunch of real-world sample tsv files for it can be found alongside the html in
+`d3-temp-rh-sensor-tsv-series-chart.zip`_.
+
+Assembled (from simple html, d3.v4.js and main js) via html-embed script from
+this repo, doesn't have any external links, can be easily used as a local file.
+
+More info can be found in the `d3-chart-for-common-temperaturerh-time-series-data`_
+blog post.
+
+.. _d3-temp-rh-sensor-tsv-series-chart.html: https://mk-fg.github.io/fgtk/scraps/d3-temp-rh-sensor-tsv-series-chart.html
+.. _d3-temp-rh-sensor-tsv-series-chart.zip: https://github.com/mk-fg/fgtk/raw/master/scraps/d3-temp-rh-sensor-tsv-series-chart.sample.zip
+.. _d3-chart-for-common-temperaturerh-time-series-data: http://blog.fraggod.net/2016/08/05/d3-chart-for-common-temperaturerh-time-series-data.html
+
+d3-du-disk-space-usage-layout
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+`d3.js`_-based xdiskusage_ implementation - app to parse ``du -b`` output and
+display directory hierarchy as d3 "partition" layout, with node size
+proportional to directory size from du output.
+
+Can be used directly via gh-pages (`d3-du-disk-space-usage-layout.html`_)
+or as a local file, doesn't have any external links.
+
+Allows uploading multiple files to display in the same hierarchy, if paths in
+them are absolute (otherwise each one will be prefixed by "root-X" pseudo-node).
+
+.. _xdiskusage: http://xdiskusage.sourceforge.net/
+.. _d3-du-disk-space-usage-layout.html: https://mk-fg.github.io/fgtk/scraps/d3-du-disk-space-usage-layout.html
+
+prometheus-snmp-iface-counters-exporter
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Script to poll 64-bit IF-MIB SNMPv3 counters for specified interface,
+checking for resets on these via NETSERVER-MIB::hrSystemUptime
+(uptime reset = fresh counter) and export these to prometheus_.
+
+It runs SNMP queries with specified -t/--snmp-poll-interval to check uptime,
+polls interface name table to find counter indexes, and then hr-counters for actual values.
+
+Exports ``iface_traffic_bytes`` metric (with "iface" and "dir" labels for interface/direction),
+as well as ``snmp_query_*`` metrics for info on general router responsiveness.
+Use -m/--metric-prefix option to add some namespace-prefix to these.
+
+Usage example::
+
+  % prometheus-snmp-iface-counters-exporter \
+     -i lte router:161 snmp-auth.secret counters.json
+
+(run with -h/--help to get info on various options)
+
+Uses `prometheus_client`_ and pysnmp_ modules for exporting and querying.
+
+.. _prometheus: https://prometheus.io/
+.. _prometheus_client: https://github.com/prometheus/client_python
+.. _pysnmp: https://github.com/etingof/pysnmp
+
+prometheus-grafana-simplejson-aggregator
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Aggregator to query prometheus_ server for specified metrics/labels, aggregate
+them by-day/week/month/year to sqlite db tables and export these via uWSGI_ for
+`Grafana Simple JSON Datasource`_.
+
+For building nice "traffic by day" (and week, month, year) bar-charts in Grafana_.
+
+Has two modes of operation:
+
+- Cron/timer mode to update aggregated values.
+
+  Example for counters from "prometheus-snmp-iface-counters-exporter" script above::
+
+    % prometheus-grafana-simplejson-aggregator \
+       --agg-labels 'dir iface' \
+       -p http://localhost:9090/p -d aggregate.sqlite \
+       -a 'iface_traffic_bytes:iface_traffic_bytes_{span}'
+
+  All combinations of existing labels will be queried and aggregated.
+  See also -h/--help output for more options/tweaks.
+
+  Will update aggregation timespans from last one stored in db (for each
+  specified metric/label combos) to the current one.
+
+- uWSGI_ application for serving values for Grafana SimpleJson plugin.
+
+  To run from terminal::
+
+    % uwsgi --http :9091 --wsgi-file prometheus-grafana-simplejson-aggregator
+
+  Proper ini file and e.g. systemd socket activation can be used in the real setup.
+
+  Settings can be controlled via environment vars (--env uwsgi directive):
+
+  - ``PMA_DEBUG=t`` - enable verbose logging, printing all headers, requests, etc.
+  - ``PMA_DB_PATH=/path/to/db.sqlite`` - aggregation database to use.
+
+  Use "table" queries in grafna in the following format::
+
+    metric ["[" label "=" val "]"] [":" span] ["@" name]
+
+  Example - ``iface_traffic_bytes_day[dir=in]:m@traffic-in`` - where:
+
+  - "iface_traffic_bytes_day" - metric name.
+  - "dir=in" - specific combination of label values, in alpha-sorted order.
+  - "m" - monthly aggregation (default - daily, see --agg-spans option).
+  - "traffic-in" - export values with "traffic-in" name/label for graph legend.
+
+These should always be combined to update db on some interval and serve values
+from there on as-needed basis (uWSGI provides a lot of options for interfaces
+and to optimize efficiency).
+
+.. _Grafana: https://grafana.com
+.. _Grafana Simple JSON Datasource: https://grafana.com/grafana/plugins/grafana-simple-json-datasource
+.. _uWSGI: https://uwsgi-docs.readthedocs.io/
+
+
+
+[scraps]
+~~~~~~~~
+
+Misc prefabs and *really* ad-hoc scripts,
+mostly stored here as templates to make something out of later.
 
 rsync-diff
 ^^^^^^^^^^
@@ -3134,56 +3584,6 @@ blog post.
 .. _sleuthkit: http://www.sleuthkit.org/sleuthkit
 .. _util-linux: https://www.kernel.org/pub/linux/utils/util-linux/
 .. _parted: http://www.gnu.org/software/parted/parted.html
-
-d3-line-chart-boilerplate
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Boilerplate `d3.js`_ page for basic line chart to plot arbitrary JS function
-outputs or data array with axii, grid, mouseover datapoint tooltips and such.
-
-Useful when for a quick chart to figure out some data or function output,
-or make it into a useful non-static link to someone,
-and don't want to deal with d3-v3/coding-style/JS diffs from bl.ocks.org.
-
-.. _d3.js: http://d3js.org/
-
-d3-temp-rh-sensor-tsv-series-chart
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-`d3.js`_-based ES6 graphing app for time-series data from rather common
-temperature (t) and relative humidity (rh) sensors (DHT22, sht1x, etc) in tsv
-(tab-separated-values) files with [iso8601-ts, t, rh] fields.
-
-Can be used directly via gh-pages: `d3-temp-rh-sensor-tsv-series-chart.html`_
-
-Bunch of real-world sample tsv files for it can be found alongside the html in
-`d3-temp-rh-sensor-tsv-series-chart.zip`_.
-
-Assembled (from simple html, d3.v4.js and main js) via html-embed script from
-this repo, doesn't have any external links, can be easily used as a local file.
-
-More info can be found in the `d3-chart-for-common-temperaturerh-time-series-data`_
-blog post.
-
-.. _d3-temp-rh-sensor-tsv-series-chart.html: https://mk-fg.github.io/fgtk/scraps/d3-temp-rh-sensor-tsv-series-chart.html
-.. _d3-temp-rh-sensor-tsv-series-chart.zip: https://github.com/mk-fg/fgtk/raw/master/scraps/d3-temp-rh-sensor-tsv-series-chart.sample.zip
-.. _d3-chart-for-common-temperaturerh-time-series-data: http://blog.fraggod.net/2016/08/05/d3-chart-for-common-temperaturerh-time-series-data.html
-
-d3-du-disk-space-usage-layout
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-`d3.js`_-based xdiskusage_ implementation - app to parse ``du -b`` output and
-display directory hierarchy as d3 "partition" layout, with node size
-proportional to directory size from du output.
-
-Can be used directly via gh-pages (`d3-du-disk-space-usage-layout.html`_)
-or as a local file, doesn't have any external links.
-
-Allows uploading multiple files to display in the same hierarchy, if paths in
-them are absolute (otherwise each one will be prefixed by "root-X" pseudo-node).
-
-.. _xdiskusage: http://xdiskusage.sourceforge.net/
-.. _d3-du-disk-space-usage-layout.html: https://mk-fg.github.io/fgtk/scraps/d3-du-disk-space-usage-layout.html
 
 asciitree-parse
 ^^^^^^^^^^^^^^^
@@ -3308,7 +3708,7 @@ rsyslogs
 Wrappers to test tools that tend to spam /dev/log regardless of their settings.
 
 rsyslogs.c is a SUID wrapper binary that uses mount --bind + unshare to replace
-/dev/log with /dev/null within namespace where it'd run rsyslog, and is made to
+/dev/log with /dev/null within namespace where it'd run rsyslog_, and is made to
 silence rsyslogd in particular.
 
 Example use (see also top of rsyslogs.c itself)::
@@ -3328,6 +3728,27 @@ connect/sendto/sendmsg and such::
 Use something like these occasionally when setting up logging on a dev machine,
 where such uncommon spam to syslog gets delivered via desktop notifications
 (see desktop/notifications/logtail tool in this repo) and annoys me.
+
+.. _rsyslog: https://www.rsyslog.com/
+
+relp-test
+^^^^^^^^^
+
+Small .c binary around librelp_ to build and send syslog message over RELP
+protocol to daemons like rsyslog_ with specified timeout.
+
+It's basically sample_client.c from librelp repository which also adds
+current ISO8601 timestamp and puts syslog message fields in the right order.
+
+Usage::
+
+  % gcc -O2 -lrelp -o relp-test relp-test.c && strip relp-test
+  % ./relp-test 10.0.0.1 514 60 34 myhost myapp 'some message'
+
+Run binary without args to get more usage info and/or see .c file header for that.
+
+.. _librelp: https://github.com/rsyslog/librelp
+
 
 
 License (WTFPL)
