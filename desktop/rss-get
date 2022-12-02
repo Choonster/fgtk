@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-import os, sys, socket, re, unicodedata, pathlib as pl
-import math, time, datetime as dt, subprocess as sp
 import urllib.request as ul, urllib.error as ule, urllib.parse as ulp
+import pathlib as pl, datetime as dt, subprocess as sp
+import os, sys, socket, re, unicodedata, math, time
 
 import feedparser as fp
 
 
 p_err = lambda *a,**k: print('ERROR:', *a, file=sys.stderr, **k) or 1
+str_norm = lambda v: unicodedata.normalize('NFKC', v).casefold()
 
 class adict(dict):
 	def __init__(self, *args, **kwargs):
@@ -20,6 +21,10 @@ conf = adict( version='1.0', socket_timeout=20.0,
 		'application/rss+xml,application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2',
 	feed_user_agent='rss-get/{ver} (github.com/mk-fg/fgtk#rss-get) feedparser/{ver_fp}' )
 conf.feed_user_agent = conf.feed_user_agent.format(ver=conf.version, ver_fp=fp.__version__)
+conf.aria2c_cmd = [ 'aria2c',
+	'-s8', '-x8', '-k', '2M', '--console-log-level=warn', '--file-allocation=none',
+	'--check-certificate=false', # workaround for aria2c or its tls lib, not important here
+	'--user-agent', conf.feed_user_agent ]
 
 
 class FeedError(Exception): pass
@@ -63,7 +68,7 @@ def feed_parse(url):
 
 def feed_entry_enclosures(entry, ext_filter=None):
 	'Return filtered list of feed entry enclosure URLs in a consistent type-order, if any.'
-	enc_urls, str_norm = list(), lambda v: unicodedata.normalize('NFKC', v).casefold()
+	enc_urls = list()
 	if ext_filter: ext_filter = str_norm(ext_filter.strip())
 	for enc in sorted(entry.enclosures or list(), key=lambda enc: enc.get('type') or '-'):
 		enc_href = enc.get('href')
@@ -135,40 +140,55 @@ def main(args=None):
 	parser = argparse.ArgumentParser(
 		description='Parse feed at the URL and print/download enclosure links from it.'
 			' Prints item info by default, unless -n/--num and/or -p/--print-urls opts are specified.'
-			' Downloads to current dir, by passing'
-				' filelist to aria2c with some parallelization options.')
-	parser.add_argument('url', help='URL or file path to grab the feed from.')
-	parser.add_argument('--file', action='store_true',
+			' Downloads to temp dir by default, passing filelist to aria2c'
+				' with some parallelization options, then moves all files to the current dir.')
+
+	group = parser.add_argument_group('Feed fetch/load options')
+	group.add_argument('url', help='URL or file path to grab the feed from.')
+	group.add_argument('--file', action='store_true',
 		help='Do not try to append https:// prefix to non-URL and non-existent paths.')
-	parser.add_argument('-f', '--file-type', metavar='ext',
-		help='Enclosure file extension or content-type to match in case-insensitive manner.'
-			' Extension gets picked from last slug of the enclosure URLs.'
-			' Examples: audio/mp3, audio/mpeg, mp3, ogg')
-	parser.add_argument('-o', '--out', metavar='file',
+	group.add_argument('-o', '--out', metavar='file',
 		help='Cache fetched feed to specified file and parse from there.'
 			' If file already exists (cached), it will be used instead of fetching URL.')
-	parser.add_argument('-n', '--num', metavar='n[-m]', action='append',
+
+	group = parser.add_argument_group('File selection/download opts')
+	group.add_argument('-n', '--num', metavar='n[-m]', action='append',
 		help='Item(s) to print/download. Downloads them by default.'
 			' Can be either an integer item number (1 is latest), or N-M for first-last (inclusive).'
 			' Can be specified multiple times for multiple items/ranges.')
-	parser.add_argument('-p', '--print-urls', action='store_true',
-		help='Print all or selected (by -n/--num) item URLs (one per line) instead of downloading.')
-	parser.add_argument('-t', '--ts-names', action='store_true',
+	group.add_argument('-f', '--file-type', metavar='ext',
+		help='Enclosure file extension or content-type to match in case-insensitive manner.'
+			' Extension gets picked from last slug of the enclosure URLs.'
+			' Examples: audio/mp3, audio/mpeg, mp3, ogg')
+	group.add_argument('-t', '--ts-names', action='store_true',
 		help='Use timestamp-derived "YY-mm-dd.HHMM.N.ext" filename, if possible.')
-	parser.add_argument('-v', '--headline-names', action='store_true',
+	group.add_argument('-v', '--headline-names', action='store_true',
 		help='Derive enclosure filename from item headline, if possible.'
-			' Can be used together with -t/--ts-names to get timestamp + heanline filename.')
-	parser.add_argument('--max-filename-len', type=int, metavar='n', default=90,
+			' Can be used together with -t/--ts-names to get timestamp + headline filename.')
+	group.add_argument('-p', '--name-prefix', metavar='prefix',
+		help='Prefix to put at the start of every downloaded filename, auto-separated by a dot.')
+	group.add_argument('--max-filename-len', type=int, metavar='n', default=90,
 		help='Maximum length for filenames produced by -t and/or -v opts (in characters, not bytes).'
 			' Anything beyond that will be cut and replaced by "--" before dot-extension suffix.'
 			' Default: %(default)s')
-	parser.add_argument('-l', '--list', action='store_true',
+	group.add_argument('-i', '--inplace', action='store_true',
+		help='Download files in-place, instead of using tmpdir and then moving them all on success.')
+
+	group = parser.add_argument_group('Listing and output modes')
+	group.add_argument('-l', '--list', action='store_true',
 		help='List feed item titles only, one per line.')
-	parser.add_argument('-m', '--list-meta', metavar='fields', default='{e.title}',
+	group.add_argument('-m', '--list-meta', metavar='fields', default='{e.title}',
 		help='Only with --list - specify output format for each item/line.'
 			' Python str formatting is used, with "e" being feed entry object from feedparser module.'
 			' See https://pythonhosted.org/feedparser/ for info on available RSS/Atom Elements.'
 			' Default: %(default)s')
+	group.add_argument('-L', '--list-urls', action='store_true',
+		help='Print all or selected (by -n/--num) item URLs (one per line) instead of downloading.')
+	group.add_argument('-C', '--list-curl', action='store_true',
+		help='List curl commands for downloading all selected files individually and exit.')
+	group.add_argument('-A', '--list-aria2', action='store_true',
+		help='Print filelist for downloading all selected files with aria2c and exit.')
+
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
 	if opts.max_filename_len < 16:
@@ -179,7 +199,10 @@ def main(args=None):
 	for v in opts.num or list():
 		m = re.search(r'^(\d+)(?:-(\d+))?$', v)
 		if not m: parser.error(f'Invalid format for -n/--num option, should be N[-M]: {v!r}')
-		ranges.append((int(m.group(1)) or 1, int(m.group(2) or 0)))
+		a, b = int(m.group(1)) or 1, int(m.group(2) or 0)
+		if not b: b = a
+		elif b < a: a, b = b, a
+		ranges.append((a, b))
 
 	feed_url = opts.url
 	if ( not opts.file
@@ -199,7 +222,7 @@ def main(args=None):
 		enc_urls = feed_entry_enclosures(e, opts.file_type)
 		ts_str, ts = feed_entry_ts(e)
 
-		if not ranges:
+		if opts.list or not ranges:
 			if not opts.list:
 				ts0, ts_diff = ts, f' +{ts_diff_str(ts - ts0)}' if ts0 else None
 				ts_diff_last = f' -{ts_diff_str(ts)}' if n == n0 else None
@@ -211,7 +234,7 @@ def main(args=None):
 			else: print(opts.list_meta.format(e=e))
 			continue
 
-		else:
+		elif ranges:
 			for a, b in ranges:
 				if n < a: continue
 				if b:
@@ -222,14 +245,14 @@ def main(args=None):
 			if not enc_urls: continue # only care about enclosures here
 
 		url = enc_urls[0]
-		if opts.print_urls: print(url)
+		if opts.list_urls: print(url)
 		else: file_urls[url] = adict(title=e.title.strip(), ts=ts, n=n)
 
 	if not file_urls: return
 
-	file_list, name_set = list(), set()
+	file_map, name_set = dict(), set()
 	for url, meta in file_urls.items():
-		file_list.append(f'{url}\n')
+		file_map[url] = None
 		name = list()
 		if opts.ts_names and meta.ts:
 			name.append(meta.ts.strftime(f'%y-%m-%d.%H%M.{1000-meta.n:03d}'))
@@ -241,12 +264,39 @@ def main(args=None):
 			name = name[:opts.max_filename_len] + '--'
 		name = name_dedup(name, name_set)
 		ext = pl.Path(ulp.urlparse(url).path).name.rsplit('.')[-1]
-		file_list.append(f'  out={name}.{ext}\n')
-	file_list = ''.join(file_list)
+		file_map[url] = f'{name}.{ext}'
 
-	sp.run(
-		[ 'aria2c', '-s8', '-x8', '-k', '2M', '--console-log-level=warn',
-			'--file-allocation=none', '--input-file', '-', '--user-agent', conf.feed_user_agent ],
-		input=file_list.encode(), check=True )
+	if opts.list_curl:
+		for url, fn in file_map.items():
+			opts = '-fL'
+			if not fn: opts += 'OJ'
+			else: opts += f"o '{fn}'"
+			print(f"  curl {opts} '{url}'")
+		return
+
+	file_list = list()
+	for url, fn in file_map.items():
+		file_list.append(f'{url}\n')
+		if fn: file_list.append(f'  out={fn}\n')
+	file_list = ''.join(file_list)
+	if opts.list_aria2: return print(file_list.strip())
+
+	if opts.inplace:
+		return sp.run(
+			[*conf.aria2c_cmd, '--input-file', '-'],
+			input=file_list.encode(), check=True ) and None
+
+	import shutil, tempfile
+	p_dst_dir = pl.Path.cwd()
+	with tempfile.TemporaryDirectory(prefix=f'.rss-get.{os.getpid()}.') as p:
+		p_tmpdir = pl.Path(p)
+		sp.run(
+			[*conf.aria2c_cmd, '--input-file', '-'],
+			cwd=p_tmpdir, input=file_list.encode(), check=True )
+		for p in sorted(p_tmpdir.iterdir(), key=lambda p: p.name):
+			p_dst = p_dst_dir
+			if ( (pre := opts.name_prefix) and not
+				str_norm(fn := p.name).startswith(str_norm(pre)) ): p_dst /= f'{pre}.{fn}'
+			shutil.move(p, p_dst)
 
 if __name__ == '__main__': sys.exit(main())

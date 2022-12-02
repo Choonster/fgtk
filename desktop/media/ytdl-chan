@@ -4,8 +4,8 @@ usage() {
 	bin=$(basename $0)
 	echo >&2 "Usage:"
 	echo >&2
-	echo >&2 "  $bin n_first [ n_last ]"
-	echo >&2 "    Download videos for youtube channel to the current dir"
+	echo >&2 "  $bin n_first [ n_last [ delay_sec ] ]"
+	echo >&2 "    Download video(s) for youtube channel to the current dir"
 	echo >&2 "     (from n_first to n_last) in same order to how they're"
 	echo >&2 "     listed in the metadata cache file (e.g. oldest-to-latest)."
 	echo >&2 "    Run in an empty dir with any numbers to get more info on how to"
@@ -34,14 +34,16 @@ usage() {
 
 
 set -o pipefail
+trap exit INT
 err=
-ytdl_opts=( ) # use ~/.config/youtube-dl/config
+ytdl=yt-dlp
+ytdl_opts=( ) # use ~/.config/<ytdl>/config
 chan_cache=_meta.json
 
 
 [[ ! -e "$chan_cache" ]] && {
 	echo >&2 "Create '$chan_cache' file with command like this one:"
-	echo >&2 "  youtube-dl -sj 'ytuser:TheGreatWar' >$chan_cache"
+	echo >&2 "  $ytdl -sj 'ytuser:TheGreatWar' >$chan_cache"
 	exit 1
 }
 
@@ -70,22 +72,24 @@ chan_cache=_meta.json
 }
 
 
-sed_exp=
+sed_exp= delay=0
 if [[ "$1" = -n || "$1" = --pick ]] ; then
-	[[ "$#" -lt 2 ]] && usage 1
+	[[ "$#" -ge 2 ]] || usage 1
 	shift
 	for n in "$@"; do sed_exp="${sed_exp}${n}p;"; done
 else
-	[[ "$#" -gt 2 ]] && usage 1
-	sed_exp="${1},${2:-9999} p"
+	[[ "$#" -le 3 ]] || usage 1
+	[[ -z "$2" ]] && sed_exp="$1 p" || sed_exp="$1,$2 p"
+	delay=${3:-0}
 fi
 
 while read n u; do
 	echo " ------ Fetching video $n"
-	youtube-dl\
-			--no-overwrites --restrict-filenames\
-			"${ytdl_opts[@]}" -o "$(printf '%03d' $n)__%(title)s.%(ext)s" "$u"\
+	$ytdl \
+			--no-overwrites --restrict-filenames \
+			"${ytdl_opts[@]}" -o "$(printf '%03d' $n)__%(title)s.%(ext)s" "$u" \
 		|| err="ERROR (last one only): n=$n code=$?"
+	[[ ! "$delay" -gt 0 ]] || { echo " --- delay: ${delay}s"; sleep "$delay"; }
 done < <(jq -r '.webpage_url' "$chan_cache" | cat -n | sed -n "$sed_exp")
 
 err=${err:-done}

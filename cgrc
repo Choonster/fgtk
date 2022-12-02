@@ -7,13 +7,15 @@
 
 set -e
 
+export LC_ALL=C
 check= list= unit= slice= stats= mode=scope
-queue= queue_delay=7 queue_timeout= value= path=
+queue= queue_delay=7 queue_timeout= value= path= props=
 
 usage() {
 	bin=${0##*/}
 	echo >&2 "Usage: $bin [-x] [-r] { -l | -c | -p | -q [opts] } { -u unit | slice }"
 	echo >&2 "       $bin [-x] -v key[=value] { -u unit | slice }"
+	echo >&2 "       $bin [-x] -s { -u unit | slice | cgroup-path }"
 	echo >&2 "       $bin [-x] [run-opts] [-u unit] slice -- cmd [args...]"
 	echo >&2 "Run-opts: [-s] [-r] [-q [-i N] [-t N]] [-v key[=value]]"
 	echo >&2
@@ -23,35 +25,41 @@ usage() {
 	echo >&2 "--system/--user mode detected from uid (--system for root, --user otherwise)."
 	echo >&2
 	echo >&2 "Options:"
-	echo >&2 "-u name - scope unit name, derived from command basename by default."
+	echo >&2 "-u name - scope unit name, with $basename.$pid from command by default."
 	echo >&2 "   Starting scope with same unit name as already running one will fail."
 	echo >&2 "   With -l/-c list/check opts, restricts check to that scope instead of slice."
+	echo >&2 "-o - same as -p/--property in systemd-run, to pass any unit parameters."
 	echo >&2 "-q - wait for all pids in slice/scope to exit before start (if any)."
 	echo >&2 "   -i - delay between checks in seconds, default=${queue_delay}s."
 	echo >&2 "   -t - timeout for -q wait (default=none), exiting with code 36 afterwards."
 	echo >&2 "-l - list all pids within specified slice recursively."
 	echo >&2 "-c - same as -l, but for exit code check: 35 = pids exist, 0 = empty."
 	echo >&2 "-s - print cgroup resource usage stats to stdout after running command."
+	echo >&2 "     Can be used w/o command to report stats for scope/slice/cgroup on ^C."
 	echo >&2 "-r - Run command as a terminal-connected service unit instead of scope."
 	echo >&2 "     Main diff is that forked pids will be killed after main one exits."
 	echo >&2 "-v - Show or set target cgroup parameter. Both key and value are raw strings."
 	echo >&2 "     Special value 'list' will list available cgroup knobs in cgroup dir."
-	echo >&2 "     Examples: -v list, -v cpu.max, -v cpu.max='900000 500000'"
+	echo >&2 "     K/M/G/T following digits can replace 000-groups, _ can separate groups."
+	echo >&2 "     Examples: -v list, -v cpu.max, -v cpu.max=max, -v cpu.max='2_900K 500K'"
 	echo >&2 "-p - Print path to specified scope/slice/service."
 	echo >&2 "-x - 'set -x' debug mode."
 	echo >&2
 	echo >&2 "Examples:"
-	echo >&2 "  cgrc -ru ff apps-browser -- firefox --profile myprofile"
+	echo >&2 "  cgrc app-ffmpeg -- ffmpeg ..."
+	echo >&2 "  cgrc -ru ff app-browser -- firefox --profile myprofile"
 	echo >&2 "  cgrc -rcu ff && echo 'ff process exited'"
-	echo >&2 "  cgrc -q apps-leech -- curl -OL http://site.com/file-to-queue.bin"
-	echo >&2 "  cgrc -l apps | xargs ps u"
-	echo >&2 "  cgrc -v cpu.max apps-pacman"
-	echo >&2 "  cgrc -v cpu.max='1500000 500000' apps-pacman"
+	echo >&2 "  cgrc -o CPUWeight=200 -o MemoryMax=6G app-browser -- chromium"
+	echo >&2 "  cgrc -q app-leech -- curl -OL http://site.com/file-to-queue.bin"
+	echo >&2 "  cgrc -l app | xargs ps u"
+	echo >&2 "  cgrc -v cpu.max app-pacman"
+	echo >&2 "  cgrc -v cpu.max='2M 500K' app-pacman"
+	echo >&2 "  cgrc -sru pulseaudio"
 	echo >&2
 	exit ${1:-1}
 }
 
-while getopts xhclqsrpi:t:u:v: a; do case $a in
+while getopts xhclqsrpi:t:u:o:v: a; do case $a in
 	h) usage 0 ;;
 	c) check=t ;;
 	l) list=t ;;
@@ -62,6 +70,7 @@ while getopts xhclqsrpi:t:u:v: a; do case $a in
 	i) queue_delay=$OPTARG ;;
 	t) queue_timeout=$OPTARG ;;
 	u) unit=$OPTARG ;;
+	o) props="$props -p $OPTARG" ;;
 	v) value=$OPTARG ;;
 	x) set -x ;;
 	\?) usage ;;
@@ -75,9 +84,10 @@ shift $(($OPTIND - 1))
 cg=
 setcg() {
 	start=$1
-	local u
+	local u=''
 	[ -z "$cg" ] || return 0
 	[ -z "$slice" ] || {
+		[ "${slice#/sys/fs/cgroup/}" = "$slice" ] || { cg=${slice#/sys/fs/cgroup}; return 0; }
 		u=$slice; [ "${u%.slice}" != "$u" ] || u="${u}.slice"
 		[ -z "$start" ] || systemctl "$t" start "$u"; }
 	[ -z "$unit" ] || { u=$unit; [ "${u%.$mode}" != "$u" ] || u="${u}.$mode"; }
@@ -110,14 +120,16 @@ slice=$1
 
 ### queue
 [ -z "$queue" ] || {
+	[ -z "$queue_timeout" ] || {
+		queue_ms=$(printf '%.0f' "$queue_timeout"e3)
+		queue_delay_ms=$(printf '%.0f' "$queue_delay"e3); }
 	setcg
 	while :; do
 		setprocs
 		[ -n "$procs" ] || break
 		[ -z "$queue_timeout" ] || {
-			queue_timeout=$(($queue_timeout - $queue_delay))
-			[ "$queue_timeout" -gt 0 ] || exit 36
-		}
+			queue_ms=$(($queue_ms - $queue_delay_ms))
+			[ "$queue_ms" -ge 0 ] || exit 36; }
 		sleep "$queue_delay"
 	done
 	[ -n "$1" ] || exit 0 # wait without command
@@ -134,34 +146,44 @@ slice=$1
 	if [ "$k" = list ]
 	then ls -1p /sys/fs/cgroup"$cg" | grep -v '/$'
 	else
-		[ "$k" = "$v" ] || echo "$v" > "$p" \
-			|| { err=$?; echo >&2 "ERROR - failed to set $k=$v [$p]"; }
-		cat "$p"
+		[ "$k" = "$v" ] || { echo "$v" | awk '{while (n++ <= NR) {
+				if (match($n,/^([0-9]+_)*[0-9]+[KMGTP]?$/)) {
+					sub("_","",$n); if (m=index("KMGTP", substr($n,length($n),1))) {
+						$n=substr($n,1,length($n)-1); while (m-- > 0) $n=$n "000" } } }; print}' \
+			> "$p"; } || { err=$?; echo >&2 "ERROR - failed to set $k=$v [$p]"; }
+		awk '{n=0; while (n++ <= NR) { m=0
+			while (match($n,/^[0-9]+[0-9]{3}$/) && m < 5) {
+				k=length($n)-3
+				if (substr($n,k+1)=="000") { $n=substr($n,1,k); m++ }
+				else while (match($n,/[0-9]{4}(_|$)/))
+					$n = substr($n,1,RSTART) "_" substr($n,RSTART+1) }
+			$n = $n substr("KMGTP", m, m ? 1 : 0) }; print}' "$p"
 	fi
 	[ -n "$1" ] || exit $err # limit get/set without command
 }
 
 
-### run
-[ -n "$1" ] || usage 0
-[ "$1" = -- ] || { echo >&2 "ERROR - args where -- should be: $@"; usage; }
-shift; [ -n "$1" ] || { echo >&2 "ERROR - no command specified"; usage; }
+### run / stats-wrapper
+if [ -n "$1" ]; then
+	[ "$1" = -- ] || { echo >&2 "ERROR - args where -- should be: $@"; usage; }
+	shift; [ -n "$1" ] || { echo >&2 "ERROR - no command specified"; usage; }
+else [ -n "$stats" ] || usage 0; fi
 
-# Unit names should have no spaces, so command can be expanded from string
-[ -n "$unit" ] && u="--unit $unit" || { u=${1##*/}; u="--unit ${u%% *}"; }
+[ -n "$unit" ] && u="--unit $unit" || { u=${1##*/}; u=${u%% *}; u="--unit $u.$$"; }
 [ "$mode" = scope ] && tu=--scope \
 	|| tu='--service-type=exec --same-dir --wait --pty --collect'
-wrapper="systemd-run -q $t $tu $u --slice $slice --"
+wrapper="systemd-run -q $t $tu $u --slice $slice$props --"
 
 if [ -z "$stats" ]
 then exec $wrapper "$@"
 else
-	cg= unit=; setcg # finds slice path
+	cg=; setcg # finds slice path
 	[ -n "$cg" ] || {
 		u=$slice; [ "${u%.slice}" != "$u" ] || u="${u}.slice"
 		systemctl "$t" start "$u" || exit 1; setcg; }
 	[ -n "$cg" ] || { echo >&2 "ERROR - no slice for -s option"; exit 1; }
-	exec python3 "$0" "$cg" $wrapper "$@"
+	if [ -z "$1" ]; then exec python3 "$0" "$cg" - # stats from now to sigint
+	else exec python3 "$0" "$cg" $wrapper "$@"; fi
 fi
 
 
@@ -184,12 +206,15 @@ def print_stats_diff(ts_diff, s1, s2):
 	print('cgroup-stats:')
 	print(f'  time [s] :: {ts_diff:,.3f}')
 	for s in s1, s2:
-		s.cpu = adict(line.strip().split(None, 1) for line in s.cpu.split('\n') if line.strip())
-		s.io = adict( (k, adict(v.split('=', 1) for v in st.split()))
+		if s1.cpu: s.cpu = adict(
+			line.strip().split(None, 1) for line in s.cpu.split('\n') if line.strip() )
+		if s1.io: s.io = adict( (k, adict(v.split('=', 1) for v in st.split()))
 			for k, st in (line.strip().split(None, 1) for line in s.io.split('\n') if line.strip()) )
-	print('  cpu-time [s] ::', ' : '.join(
-		f'{rmsuff(k, "_usec")} {{:,.1f}}'.format((int(s2.cpu[k]) - int(v1)) / 1e6)
-		for k, v1 in s1.cpu.items() ))
+	if s1.cpu:
+		print('  cpu-time [s] ::', ' : '.join(
+			f'{rmsuff(k, "_usec")} {{:,.1f}}'.format((int(s2.cpu[k]) - int(v1)) / 1e6)
+			for k, v1 in s1.cpu.items() ))
+	if not s1.io: return
 	dev_map, p_dev = dict(), pl.Path('/dev/disk/by-label')
 	for p in p_dev.iterdir():
 		try:
@@ -213,12 +238,16 @@ def print_stats_diff(ts_diff, s1, s2):
 
 def main():
 	cmd, cg = sys.argv[2:], pl.Path('/sys/fs/cgroup') / sys.argv[1].strip('/')
+	if len(cmd) == 1 and cmd[0] == '-': cmd = None
 	stats = adict(dict.fromkeys('cpu io'.split()))
-	for p in stats: stats[p] = (cg / f'{p}.stat').read_text()
+	for p in list(stats):
+		try: stats[p] = (cg / f'{p}.stat').read_text()
+		except OSError: stats[p] = print(f'Skipping unavailable stats-group: {p}')
 	ts_diff = time.monotonic()
-	err = run(*cmd)
+	try: err = run(*cmd) if cmd else time.sleep(2**30)
+	except KeyboardInterrupt: err = print() or 130 # code when interrupting "sleep"
 	ts_diff = time.monotonic() - ts_diff
-	stats_new = adict((p, (cg / f'{p}.stat').read_text()) for p in stats)
+	stats_new = adict((p, (cg / f'{p}.stat').read_text()) for p, v in stats.items() if v)
 	print_stats_diff(ts_diff, stats, stats_new)
 	return err
 
@@ -227,5 +256,5 @@ except Exception as err:
 	print(
 		'ERROR - cgroup-stats wrapper failed:'
 		f' [{err.__class__.__name__}] {err}', file=sys.stderr )
-	sys.exit(1)
+sys.exit(1)
 EOF

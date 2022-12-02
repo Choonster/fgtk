@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+
+import os, sys, io, re, glob, stat, struct, enum, base64, pathlib as pl
+
+
+def make_uidgid_resolver( numeric=False,
+		num_hex=False, offset=(0, 0), mask_and=None, mask_or=None ):
+	'Return uidgid func with baked-in processing parameters'
+	if numeric: uid_func = gid_func = None
+	else:
+		import pwd, grp
+		uid_func = lambda n: pwd.getpwuid(n).pw_name
+		gid_func = lambda n: grp.getgrgid(n).gr_name
+	def uidgid(uid=None, gid=None):
+		'Returns specified id, resolved according to baked-in parameters'
+		res = list()
+		for offset, (n, resolve) in zip(
+				uidgid.offset, [(uid, uid_func), (gid, gid_func)] ):
+			if n is None: continue
+			if resolve:
+				try: res.append(resolve(n)); continue
+				except KeyError: pass
+			if offset: n += offset
+			if mask_and is not None: n &= mask_and
+			if mask_or is not None: n |= mask_or
+			res.append(f'{n:x}' if num_hex else str(n))
+		return res if len(res) != 1 else res[0]
+	uidgid.offset = offset
+	return uidgid
+
+
+class ACLTag(enum.IntEnum):
+	uo = 0x01; u = 0x02; go = 0x04; g = 0x08
+	mask = 0x10; other = 0x20
+	str = property(lambda s: s._name_)
+
+class ACLPerm(enum.IntFlag):
+	r = 4; w = 2; x = 1
+	str = property(lambda s: ''.join(
+		(v._name_ if v in s else '-') for v in s.__class__ ))
+
+def parse_acl(acl, uidgid, prefix=''):
+	acl, lines = io.BytesIO(acl), list()
+	if (v := acl.read(4)) != b'\2\0\0\0':
+		raise ValueError(f'ACL version mismatch [ {v} ]')
+	while True:
+		if not (entry := acl.read(8)): break
+		elif len(entry) != 8: raise ValueError('ACL length mismatch')
+		tag, perm, n = struct.unpack('HHI', entry)
+		tag, perm = ACLTag(tag), ACLPerm(perm)
+		match tag:
+			case ACLTag.uo | ACLTag.go:
+				lines.append(f'{tag.str[0]}::{perm.str}')
+			case ACLTag.u | ACLTag.g:
+				name = uidgid(uid=n) if tag is tag.u else uidgid(gid=n)
+				if set(name).intersection(':,'): raise ValueError(n, name)
+				lines.append(f'{tag.str}:{name}:{perm.str}')
+			case ACLTag.other: lines.append(f'o::{perm.str}')
+			case ACLTag.mask: lines.append(f'm::{perm.str}')
+			case _: raise ValueError(tag)
+	return ','.join(f'{prefix}{s}' for s in lines)
+
+
+Caps = enum.IntEnum('Caps', dict((cap, 1 << n) for n, cap in enumerate((
+	' chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap'
+	' linux_immutable net_bind_service net_broadcast net_admin net_raw ipc_lock ipc_owner'
+	' sys_module sys_rawio sys_chroot sys_ptrace sys_pacct sys_admin sys_boot'
+	' sys_nice sys_resource sys_time sys_tty_config mknod lease audit_write audit_control'
+	' setfcap mac_override mac_admin syslog wake_alarm block_suspend audit_read'
+	' perfmon bpf checkpoint_restore' ).split())))
+
+def parse_caps(cap):
+	cap = io.BytesIO(cap)
+	ver, eff = ((v := struct.unpack('I', cap.read(4))[0]) >> 3*8) & 0xff, v & 1
+	if ver not in [2, 3]: raise ValueError(f'Unsupported capability v{ver}')
+	perm1, inh1, perm2, inh2 = struct.unpack('IIII', cap.read(16))
+	if (n := len(cap.read())) != (n_tail := {2:0, 3:4}[ver]):
+		raise ValueError(f'Cap-string length mismatch [ {n} != {n_tail} ]')
+	perm_bits, inh_bits = perm2 << 32 | perm1, inh2 << 32 | inh1
+	perm, inh = set(), set()
+	for c in Caps:
+		if perm_bits & c.value: perm.add(c.name); perm_bits -= c.value
+		if inh_bits & c.value: inh.add(c.name); inh_bits -= c.value
+	if perm_bits or inh_bits:
+		raise ValueError(f'Unrecognized cap-bits: P={perm_bits:x} I={inh_bits:x}')
+	if not (eff or perm or inh): return ''
+	cap_str = lambda caps: ','.join(sorted(caps, key=Caps.__getitem__))
+	caps = [cap_str(perm) + ':' + cap_str(inh)]
+	if perm and perm.issubset(inh):
+		caps.extend([
+			'' + cap_str(perm) + ':+' + cap_str(inh-perm),
+			'-' + cap_str(inh-perm) + ':' + cap_str(inh) ])
+	elif inh and inh.issubset(perm):
+		caps.extend([
+			'+' + cap_str(perm-inh) + ':' + cap_str(inh),
+			'' + cap_str(perm) + ':-' + cap_str(perm-inh) ])
+	caps = sorted(caps, key=len)[0]
+	pre = ''.join(v for v,e in zip('EPI', [eff, perm, inh]) if e)
+	return (pre + ':' + caps).rstrip(':')
+
+
+def openat2_read(p_git, p, _cache=[]):
+	'Reads and returns contents of p under p_git dir reliably'
+	# Simple way to avoid symlink-related race-conditions w/o disallowing them:
+	#  p = realpath(path); validate_is_acceptable(p); file = openat2(p, no_symlinks)
+	# As of 2022-10-13 glibc has no openat2() wrapper yet, hence syscall here.
+	p = (p_git / p).resolve(True)
+	if not p.is_relative_to(p_git):
+		raise PermissionError( '-f/--git-ls-file'
+			' points to outside git repo dir [ {p_git} ]: {p}' )
+	if not _cache:
+		import ctypes as ct
+		openat2_how = ct.create_string_buffer(struct.pack(
+			'@QQQ', os.O_RDONLY | os.O_NOFOLLOW, 0, res_no_symlinks := 0x04 ))
+		c_sys_openat2, c_at_fdcwd, openat2_how_len = 437, -100, len(openat2_how) - 1
+		c_syscall = ct.CDLL(None, use_errno=True).syscall
+		def _openat2(p):
+			fd = c_syscall( c_sys_openat2,
+				c_at_fdcwd, bytes(p), openat2_how, openat2_how_len )
+			if fd < 0: raise OSError(err := ct.get_errno(), os.strerror(err))
+			return open(fd, 'r')
+		_cache.append(_openat2)
+	with _cache[0](p) as src: return src.read()
+
+
+def main(args=None):
+	import argparse, textwrap
+	dd = lambda text: re.sub( r' \t+', ' ',
+		textwrap.dedent(text).strip('\n') + '\n' ).replace('\t', '  ')
+	parser = argparse.ArgumentParser(
+		usage='%(prog)s [options] [git-dirs]',
+		formatter_class=argparse.RawTextHelpFormatter, description=dd('''
+			Build a manifest of full permissions (uid/gid/mode/acls/xattrs)
+				for files under git control in specified repository(-ies), to stdout.
+			Intended to be used with repos of config files on mutable hosts,
+				which are directly used there by the apps,
+				so permissions on them (as well as their paths) matter,
+				and can be checked into git on commits, to be tracked/fixed.'''))
+
+	parser.add_argument('git-dirs', nargs='*', help=dd('''
+		Path(s) with ".git" directories in them, to get repo file-list from.
+		Paths can have glob/fnmatch shell-style wildcards in them (python glob module).
+		Does not raise warnings/errors for dirs that don't have .git repo in them.
+		Default is to work with git repository in the current dir.'''))
+	parser.add_argument('-f', '--git-ls-file', metavar='rel-path', help=dd('''
+		Instead of running "git ls-files" in each of the paths,
+			read same (newline-separated output) from specified path inside repo dir(s).
+		If file is missing in any of the specified/detected repositories, error will be raised.
+		Special "-" (hyphen) value will read list from stdin, allowing only one git-repo dir.'''))
+
+	group = parser.add_argument_group('Output options')
+	group.add_argument('-o', '--output',
+		metavar='[ugtmacxn]', default='ugtmacxn', help=dd('''
+			Combination of one-letter flags for what to print for each path:
+				u - user/uid, g - group/gid (see "uid/gid options" below for these),
+				t - node type before mode (f/d/l/etc), m - octal permissions/mode,
+				c - capabilities, a - POSIX ACLs (access/default, if exist), x - xattrs,
+				n - skip printing non-root paths for which resulting permission-string is empty.
+			Default: print everything that is there.'''))
+
+	group = parser.add_argument_group('uid/gid options')
+	group.add_argument('-n', '--ids-numeric', action='store_true',
+		help='Do not resolve uid/gid values to names, leave as numbers.')
+	group.add_argument('-H', '--ids-hex', action='store_true', help=dd('''
+		Whenever numeric id is output, use hexadecimal numbers instead of decimal.
+		This can be useful for composite uid/gid values,
+			where specific bytes have separate meanings, e.g. ids in systemd-nspawn.
+		Can be combined with -n/--ids-numeric, but does not imply it.'''))
+	group.add_argument('--ids-offset-from-root', action='store_true', help=dd('''
+		Output numeric uid/gid values as an offset from
+			uid/gid of the repository root directory, applied before mask, if any.
+		Might be useful with idmapped mounts or userns containers.'''))
+	group.add_argument('--ids-mask', metavar='and-hex(/or-hex)', help=dd('''
+		Two hex and-mask[/or-mask] numbers to apply to all output numeric uids/gids.
+		Can be used to discard specific bits/bytes in a composite/mapped id numbers.
+		Masks are only used on last N bytes specified in them, ignoring other bytes.
+		Value like "/f10000" can be used to only specify bitwise OR mask without AND part.'''))
+
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	git_dirs = getattr(opts, 'git-dirs')
+	if not git_dirs:
+		git_dirs = [pl.Path('.')]
+		if not (git_dirs[0] / '.git').is_dir():
+			parser.error('No git-dirs specified and current dir is not a repository')
+	git_dirs, git_dirs_src = list(), git_dirs
+	for p in git_dirs_src:
+		for p in map(pl.Path, glob.glob(os.path.expanduser(p), recursive=True)):
+			if (p / '.git').is_dir(): git_dirs.append(p)
+	git_dirs.sort(key=lambda p: str(p.resolve()))
+
+	if not opts.git_ls_file:
+		import subprocess as sp
+		git_ls_files = lambda p_git: sp.run( ['git', 'ls-files', '-z'],
+			check=True, cwd=p_git, stdout=sp.PIPE ).stdout.decode().split('\0')
+	elif opts.git_ls_file == '-':
+		if len(git_dirs) != 1:
+			parser.error( 'Reading -f/--git-ls-file from'
+				' stdin allows processing only one git-dir.' )
+		git_ls_files = ( lambda p_git:
+			sys.stdin.read().translate(dict(zip(b'\r\n', [None, '\0']))).split('\0') )
+	else:
+		git_ls_files = ( lambda p_git:
+			list(s.rstrip('\r') for s in openat2_read(
+				p_git, opts.git_ls_file ).split('\n') if s.strip()) )
+
+	if not opts.ids_mask: mask_and = mask_or = None
+	else:
+		mask_and, sep, mask_or = opts.ids_mask.partition('/')
+		mask_and, mask_or = (
+			int(pad*max(0, 16 - len(m)) + m, 16)
+			for m, pad in [(mask_and, 'f'), (mask_or, '0')] )
+	uidgid = make_uidgid_resolver( numeric=opts.ids_numeric,
+		num_hex=opts.ids_hex, mask_and=mask_and, mask_or=mask_or )
+
+	out = dict.fromkeys(parser.get_default('output'))
+	out.update(dict.fromkeys(opts.output, True))
+	out = type('Output', (object,), out)
+
+	git_paths = dict()
+	for n, p_git in enumerate(git_dirs):
+		p_git = git_dirs[n] = p_git.resolve()
+		git_paths[p_git] = p_git; git_paths[p_git / '.git'] = '.git'
+		git_ls = git_ls_files(p_git)
+		for p in sorted(git_ls):
+			if not p: continue
+			p = pl.Path((ps := pl.Path(p).parts)[0])
+			git_paths[p_git / p] = p
+			for c in ps[1:]: p /= c; git_paths[p_git / p] = p
+
+	p_types = list(
+		(t, getattr(stat, f'S_IS{k.upper()}'))
+		for t, k in zip( 'f d c b p l s d w'.split(),
+			'reg dir chr blk fifo lnk sock door wht'.split() ) )
+	p_git = None
+	for p, p_str in git_paths.items():
+		p_root = p_str in git_dirs
+		if p_root:
+			if p_git: print()
+			p = p_git = p_str
+		else: p = p_git / p_str
+		perm = ''
+
+		if out.u or out.g or out.t or out.m:
+			try: st = p.stat(follow_symlinks=False)
+			except FileNotFoundError: continue
+			ext = list()
+			if out.u or out.g:
+				if opts.ids_offset_from_root and p_root:
+					uidgid.offset = -st.st_uid, -st.st_gid
+				st_user, st_group = uidgid(st.st_uid, st.st_gid)
+				if out.u: ext.append(st_user)
+				if out.g: ext.append(st_group)
+			if out.t or out.m:
+				st_type = ''.join(t for t, chk in p_types if chk(st.st_mode)) if out.t else ''
+				st_mode = f'{stat.S_IMODE(st.st_mode):04o}' if out.m else ''
+				ext.append(st_type + st_mode)
+			perm += ':'.join(ext)
+
+		if out.a or out.c or out.x:
+			caps, acls, xattrs = list(), list(), dict(
+				(k, os.getxattr(p, k, follow_symlinks=False))
+				for k in os.listxattr(p, follow_symlinks=False) )
+			if (cap := xattrs.pop('security.capability', '')) and out.c:
+				caps.append(parse_caps(cap))
+			if (acl := xattrs.pop('system.posix_acl_access', '')) and out.a:
+				acls.append(parse_acl(acl, uidgid))
+			if (acl := xattrs.pop('system.posix_acl_default', '')) and out.a:
+				acls.append(parse_acl(acl, uidgid, 'd:'))
+			if not out.x: xattrs.clear()
+			if caps or acls or xattrs:
+				perm += f'/{",".join(caps)}'
+				if acls or xattrs:
+					perm += f'/{",".join(acls)}'
+					if xattrs:
+						ext = list()
+						for k,v in xattrs.items():
+							try:
+								v = v.decode('ascii')
+								if ',' in v or ':' in v: raise ValueError
+							except ValueError:
+								v = ':' + base64.urlsafe_b64encode(v).decode()
+							ext.append(f'{k}={v}')
+						perm += f'/{",".join(ext)}'
+
+		if out.n and not (p_root or perm): continue
+		if perm: perm = ' ' + perm
+		print((str(p_str) if p_root else f'  {p_str}') + perm)
+
+if __name__ == '__main__': sys.exit(main())
