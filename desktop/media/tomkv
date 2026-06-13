@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+
+import pathlib as pl, subprocess as sp, textwrap as tw
+import os, sys, json, re, math, time, string
+
+
+class adict(dict):
+	@classmethod
+	def rec_make(cls, *args, _rec=id, **kws):
+		v, ids, rec_key = (
+			_rec if _rec is not id else (dict(*args, **kws), adict(), id) )
+		if isinstance(v, (dict, list)):
+			if (vid := id(v)) in ids: raise ValueError(
+				f'Recursive data at [ {".".join(map(str, ids.values()))} ]' )
+			if rec_key is not id: ids = adict(ids); ids[rec_key] = vid
+			if isinstance(v, dict): v = cls(
+				(k, cls.rec_make(_rec=(v, ids, k))) for k,v in v.items() )
+			elif isinstance(v, list): v = list(
+				cls.rec_make(_rec=(v, ids, f'[{n}]')) for n,v in enumerate(v) )
+		return v
+	def __init__(self, *args, **kws):
+		super().__init__(*args, **kws)
+		self.__dict__ = self
+
+def sz_repr(size, _units=list(
+		reversed(list((u, 2 ** (n * 10)) for n, u in enumerate('BKMGT'))) )):
+	for u, u1 in _units:
+		if size > u1: break
+	if u1 > 1: size = f'{size/u1:.1f}'.removesuffix('.0')
+	return f'{size}{u}'
+
+def wrap_to_lines(chunks, w=80, w_max=110, s=' ', s_chunks='', split=None, **wrap):
+	'Wrap s-joined chunks to least lines of roughly same length within w-w_max range'
+	wrap = dict(dict(break_long_words=False, break_on_hyphens=False, tabsize=2), **wrap)
+	if s_chunks: chunks = list( # normalize spaces within chunks
+		s_chunks.join(c.split()).replace(s_chunks, '\ue9ae') for c in chunks )
+	chunks = s.join(c.replace(s, '\ue9ad') for c in chunks)
+	for n in range(w_max, w-1, -1):
+		split_new = tw.wrap(chunks, n, **wrap)
+		if split and len(split_new) > len(split): break
+		split = split_new
+	if s_chunks: split = list(c.replace('\ue9ae', s_chunks) for c in split)
+	return list(c.replace('\ue9ad', s) for c in split)
+
+class sh_str_raw(str): __slots__ = () # str for sh_repr to skip quoting
+class sh_str_dq(str): __slots__ = () # str for sh_repr to double-quote without other changes
+def sh_repr(s): # same idea as in shlex.quote, likely unsafe anyway
+	if not s: return "''"
+	elif isinstance(s, sh_str_raw): return str(s)
+	elif isinstance(s, sh_str_dq): return f'"{s}"'
+	elif not isinstance(s, str): s = str(s)
+	if s.isascii() and not s.encode().translate(
+		None, delete=b'%+,-./0123456789:=@ABCDEFGHIJKLMN'
+		b'OPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz' ): return s
+	return "'" + s.replace("'", "'\\''") + "'"
+
+
+_td_days = dict(
+	y=365.2422, yr=365.2422, year=365.2422,
+	mo=30.5, month=30.5, w=7, week=7, d=1, day=1 )
+_td_s = dict( h=3600, hr=3600, hour=3600,
+	m=60, min=60, minute=60, s=1, sec=1, second=1 )
+_td_usort = lambda d: sorted(
+	d.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True )
+_td_re = re.compile('(?i)^[-+]?' + ''.join( fr'(?P<{k}>\d+{k}\s*)?'
+	for k, v in [*_td_usort(_td_days), *_td_usort(_td_s)] ) + '\\Z')
+
+def td_parse(td_str):
+	try: return float(td_str)
+	except: td = 0
+	if (m := _td_re.search(td_str)) and any(m.groups()):
+		# Short time offset like "3d 5h"
+		for n, units in enumerate((_td_days, _td_s)):
+			tdx = 0
+			for k, v in units.items():
+				if not m.group(k): continue
+				tdx += v * int(''.join(filter(str.isdigit, m.group(k))) or 1)
+			td += (24*3600)**(1-n) * tdx
+		return td
+	if m := re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2}(?P<us>\.\d+)?)?', td_str):
+		# [[HH:]MM:]SS where seconds can be fractional
+		return sum(n*float(m) for n,m in zip((3600, 60, 1), td_str.split(':')))
+	raise ValueError(f'Failed to parse time-delta spec: {td_str}')
+
+def td_repr(delta, units_max=2, units_res=None, _units=dict(
+		h=3600, m=60, s=1, y=365.2422*86400, mo=30.5*86400, w=7*86400, d=1*86400 )):
+	res, s, n_last = list(), abs(delta), units_max - 1
+	units = sorted(_units.items(), key=lambda v: v[1], reverse=True)
+	for unit, unit_s in units:
+		val = math.floor(s / unit_s)
+		if not val:
+			if units_res == unit: break
+			continue
+		if len(res) == n_last or units_res == unit:
+			val, n_last = round(s / unit_s), True
+		res.append(f'{val:.0f}{unit}')
+		if n_last is True: break
+		s -= val * unit_s
+	return ' '.join(res) if res else '<1s'
+
+def retries_within_timeout(tries, timeout, delay_min=0, slack=None, e=10):
+	'Return list of delays to make exactly n retries within timeout'
+	if tries * delay_min * 1.1 > timeout: raise ValueError('tries * delay_min ~> timeout')
+	if tries == 1: return [max(delay_min, timeout / 2)]
+	# delay_calc is picked to produce roughly [0, m] range with n=[1, tries] inputs
+	delay_calc = lambda m,n,_d=e**(1/tries-1): m * (e ** (n / tries - 1) - _d)
+	a, b = 0, delay_min + timeout * 1.1
+	if not slack: slack = max(0.5 * delay_min, 0.1 * (timeout / tries))
+	try:
+		for bisect_step in range(50):
+			n, m, delays = 0, (a + b) / 2, list()
+			while len(delays) < tries:
+				if (td := delay_calc(m, n := n + 1)) < delay_min: continue
+				delays.append(td)
+			if a == b or abs(error := sum(delays) - timeout) < slack: return delays
+			elif error > 0: b = m
+			else: a = m
+	except OverflowError: pass # [tries*delay_min, timeout] range can be too narrow
+	if not delay_min: slack *= 2
+	return list( (delay_min+td) for td in
+		retries_within_timeout(tries, timeout - delay_min*(tries-1), slack=slack, e=e) )
+
+
+def parse_rgb10_pixfmts():
+	'Return a set of 10b video pixel formats, to know when converting those is needed'
+	probe = sp.run( ['ffmpeg', '-v', 'fatal', '-pix_fmts'],
+		check=True, stdin=sp.DEVNULL, stdout=sp.PIPE )
+	parse, pxfmt_set = False, set()
+	for line in probe.stdout.decode().splitlines():
+		if not (line := line.strip()): continue
+		if not parse:
+			if line == '-----': parse = True
+			continue
+		try:
+			flags, fmt, nc, nb, cbits = line.split()
+			nc, nb = int(nc), int(nb)
+		except: raise RuntimeError(f'Failed to decode "ffmpeg -pix_fmts" line: {line!r}')
+		if flags[0] != 'I': continue
+		if nc == 3 and nb <= 15 and cbits == '10-10-10': pxfmt_set.add(fmt)
+	if not parse: raise RuntimeError('Failed to decode "ffmpeg -pix_fmts" output')
+	return pxfmt_set
+
+def src_probe(p, vn=0, an=0, at=None, atts=False, pxfmts_10b=None):
+	'Return info on relevant streams in input file, filtered by vn/an options'
+	try: mtime = p.stat().st_mtime
+	except OSError: return adict(t='access', fatal=1, msg='File missing/inaccessible')
+	probe = sp.run( [ 'ffprobe', '-v', 'fatal',
+			'-show_entries', 'stream:format', '-print_format', 'json', str(p) ],
+		check=True, stdin=sp.DEVNULL, stdout=sp.PIPE )
+	vx, ax = vn, an; ac = sc = 0; probe = adict.rec_make(json.loads(probe.stdout))
+	video = audio = dict(); errs, subs, multistream = list(), list(), None
+	if (fmt := probe.format.format_name) in ['ass', 'srt', 'microdvd']:
+		return adict(t='format', fatal=1, msg=f'Subtitle file [{fmt}]')
+	for s in probe.streams:
+		if not (ct := s.get('codec_type')): continue
+
+		if ct == 'video':
+			if vn:
+				if vn is ... or (vn := vn - 1): continue
+				vn = ...
+			elif video:
+				if s.codec_name == 'mjpeg': continue # as long as it's not the first stream
+				multistream = True; continue
+			if fps := s.get('avg_frame_rate') or 0:
+				if '/' not in fps: fps = float(fps)
+				else: a, b = map(float, fps.split('/')); fps = a and b and a/b
+			video = adict( n=vx, c=s.codec_name, fps=fps,
+				w=s.width, h=s.height, pxf=s.pix_fmt, br=int(s.get('bit_rate') or 0) )
+
+		if ct == 'audio':
+			ac += 1
+			if an:
+				if an is ... or (an := an - 1): continue
+				an = ...
+			if at:
+				tags = dict((k.lower(), str(v).lower()) for k, v in s.get('tags', dict()).items())
+				if err := ' '.join( f'{k}=[ {sh_repr(tags.get(k))} != {sh_repr(v)} ]'
+						for k, v in at.items() if tags.get(k) != v ):
+					if an: errs.append(adict( t='audio',
+						msg=f'Index/tags mismatch: #{ax} {err}' ))
+					else: continue
+				elif not an: ax = ac
+			if not audio: audio = adict(n=ax, enc=list())
+			elif an is not None: multistream = True; continue
+			audio.enc.append(adict(c=s.codec_name, cn=s.channels))
+
+		if ct == 'subtitle':
+			if s.get('codec_name') in [None, 'dvb_subtitle', 'dvd_subtitle', 'hdmv_pgs_subtitle']:
+				errs.append(adict(t='subs', msg='Has bitmap or unrecognized subtitles'))
+			else: subs.append(sc)
+			sc += 1
+
+	if not (audio and video):
+		errs.append(adict(t='format', fatal=1, msg='Missing/unmatched A/V streams'))
+	if multistream: errs.append(adict(t='format', fatal=1, msg='Multiple A/V streams'))
+	data = adict( v=video, a=audio, s=subs, atts=atts, errs=errs, mtime=mtime,
+		td=float(probe.format.duration), sz=int(probe.format.size), desc=None )
+	data.desc = src_probe_desc(probe, data, pxfmts_10b)
+	return data
+
+def src_probe_desc(p, d=dict(), pxfmts_10b=None):
+	'Return multiline description of file contents - container, streams, formats, etc'
+	td, sz = d.get('td', float(p.format.duration)), d.get('sz', int(p.format.size))
+	desc_lines = list()
+	if (n := float(p.format.get('probe_score', 0))) < 100:
+		desc_lines.append(f'WARNING: only partial probe success = {round(n)} / 100')
+	vx, ax = (d.get(k, dict()).get('n', -1) for k in 'va')
+	sxs, tx = d.get('s', [-1]), d.get('atts')
+
+	tags_drop, tsn = dict(), 0
+	for s in p.streams:
+		if not (tags := s.get('tags')): continue
+		tsn += 1
+		for kv in tags.items(): tags_drop.setdefault(kv, 0); tags_drop[kv] += 1
+	tags_drop = set(k for (k, v), n in tags_drop.items() if n == tsn)
+	tags_drop.add('ENCODER')
+
+	vn = an = sn = att_bs = 0
+	for s in p.streams:
+		if not (ct := s.get('codec_type')): continue
+		sit, sin, six = ct.title(), '#' + str(s.get('index', '?')), ' '
+		sil1, sil2 = [s.get('codec_name')], list()
+		if (sd := s.get('disposition', dict())).get('default'): sil2.append('<default>')
+
+		if ct == 'video':
+			is_10b = pxfmts_10b and s.pix_fmt in pxfmts_10b
+			if all(wh := [s.get('width'), s.get('height')]):
+				sil1.append(wh := 'x'.join(map(str, wh)))
+				if is_10b: sil1[-1] += '.10b'
+				if ar := s.get('display_aspect_ratio'):
+					if (ars := s.get('sample_aspect_ratio')) != '1:1': ar += f'.{ars}'
+					if ar != wh.replace('x', ':'): sil1.append(f'[ {ar} ]')
+			elif is_10b: sil1.append('10b')
+			if fps := s.get('avg_frame_rate'):
+				if '/' not in fps: fps = float(fps)
+				else: a, b = map(float, fps.split('/')); fps = a and b and a/b
+				if fps: fps = f'{fps:.1f}'.removesuffix('.0'); sil1.append(f'{fps}fps')
+			if sd.get('attached_pic'): sit = 'Image'
+			else:
+				vn += 1; sin = vn
+				if vn == (vx or 1): six = 'x'
+
+		if ct == 'audio':
+			if c := s.get('channels'): sil1.append(f'{c}ch')
+			if len(sr := str(s.get('sample_rate', ''))) > 3: sil1.append(sr[:-3] + 'k')
+			sit = ' Audio'; an += 1; sin = an
+			if not ax or an == ax: six = 'x'
+
+		if ct == 'subtitle':
+			if sxs and sn in sxs: six = 'x'
+			sit = 'Subs'; sn += 1; sin = sn
+
+		if ct == 'attachment':
+			if bs := s.get('extradata_size'): sil1.append(sz_repr(bs)); att_bs += bs
+			sit, six = ' Att', 'x' if tx else six
+
+		ext = [f' [{six}] {sit} {sin} : ' + (e := ' '.join(filter(None, sil1 + sil2)))]
+		if tags := s.get('tags'):
+			for k, v in list(tags.items()): # check for _STATISTICS_TAGS-eng and such
+				if not (m := re.fullmatch(r'_STATISTICS_TAGS(-\w+)?', k)): continue
+				for k in v.split(): tags.pop(k, ''); m[1] and tags.pop(f'{k}{m[1]}', '')
+			for k in list(tags): # other non-useful stats-tags
+				if k.startswith('_STATISTICS_') or k in tags_drop: tags.pop(k)
+			if tags := list( f'{k}={sh_repr(v)}' for k,v in tags.items()
+					if all(c in string.printable for c in v.replace(' ', '')) ):
+				if len(e := ext[-1] + (e and ' :: ') + ' '.join(tags)) < 110: ext[-1] = e
+				else: ext = wrap_to_lines([ext[-1] + ' ::', *tags], subsequent_indent=' '*7)
+
+		desc_lines.extend(ext)
+
+	br, att_bs = (sz - att_bs) / td, '' if not att_bs else f' + {sz_repr(att_bs)} atts'
+	desc_lines.insert(0, 'Container: ' + str(
+		p.format.get('format_long_name') or p.format.get('format_name') or '???')
+		+ ' :: ' + f'{td_repr(td)} in {sz_repr(sz)} [ {sz_repr(br)} per second{att_bs} ]' )
+	return '\n'.join(desc_lines)
+
+
+def ffmpeg_extract_atts(src_list, p_dst, replace=False, quiet=False):
+	'Extracts attachments via tmpdir, matching those case-insensitively vs p_dst'
+	import tempfile, hashlib as hl; warn_n, warn_dedup = 0, set()
+	def _warn(src, msg):
+		nonlocal warn_n; warn_n += 1
+		if quiet: return
+		if msg in warn_dedup:
+			if ... in warn_dedup: return
+			print(f'{src} :: WARNING :: ...hiding exactly-same repeated warnings')
+			return warn_dedup.add(...)
+		print(f'{src} :: WARNING :: {msg}'); warn_dedup.add(msg)
+	with tempfile.TemporaryDirectory(prefix='.tomkv.extract-atts.') as tmp:
+		(p_last := (p_tmp := pl.Path(tmp)) / 'new').mkdir()
+		csums = dict(( p.name.lower(),
+			adict(h=None, p=p )) for p in p_dst.iterdir() if p.is_file())
+		for src, srcx in src_list:
+			for p in p_last.iterdir(): p.unlink()
+			out = sp.run( ['ffmpeg', '-v', 'error', '-dump_attachment:t', '', '-i', srcx],
+				env=dict(AV_LOG_FORCE_NOCOLOR='1'), cwd=p_last,
+				stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.STDOUT )
+			out = out.stdout.decode().strip().splitlines()
+			try: out.remove('At least one output file must be specified')
+			except ValueError: pass
+			if out := '\n'.join(out).strip(): _warn(src.name, (
+				f'ffmpeg had issues processing path: {srcx.name}\n'
+				+ tw.indent(out, '  [ffmpeg] ') ).strip()); continue
+			for p in p_last.iterdir():
+				if not (csum := csums.get(fn := p.name.lower())):
+					p.rename(p_new := p_tmp / p.name)
+					csums[fn] = adict(h=None, p=p_new); continue
+				if not csum.h:
+					with csum.p.open('rb') as pf:
+						csum.h = hl.file_digest(pf, hl.sha256).digest()
+				with p.open('rb') as pf: h2 = hl.file_digest(pf, hl.sha256).digest()
+				if h2 == csum.h: continue
+				act = 'discarding' if not replace else 'replacing'
+				sz_a, sz_b = (pc.stat().st_size for pc in [csum.p, p])
+				_warn( src.name, f'Same-name att-file mismatch,'
+					f' {act} it [ {p.name} ]: {sz_repr(sz_a)} -> {sz_repr(sz_b)}' )
+				if not replace: continue
+				csum.p.unlink(); p.rename(p_new := p_tmp / p.name); csum.update(h=h2, p=p_new)
+		new_sz = list()
+		for p in p_tmp.iterdir():
+			if not p.is_file(): continue
+			with p.open('rb') as a, (p_dst / p.name).open('xb') as b:
+				b.write(data := a.read()); new_sz.append(len(data))
+	ext = list()
+	if new_sz: ext.append(f' [ {sz_repr(sum(new_sz))} ]')
+	if warn_n: ext.append(f', {warn_n:,d} WARNING(s)')
+	print( f'Extracted/collected {len(new_sz):,d} / {len(csums):,d} new'
+		f' attachment(s) from {len(src_list):,d} source file(s){"".join(ext)}' )
+	return bool(warn_n and not quiet)
+
+
+def main(args=None):
+	import argparse
+	dd = lambda text: re.sub( r' \t+', ' ',
+		tw.dedent(text).strip('\n') + '\n' ).replace('\t', '  ')
+	parser = argparse.ArgumentParser(
+		formatter_class=argparse.RawTextHelpFormatter,
+		usage='%(prog)s [options] src [src ...]', description=dd('''
+			ffprobe-check and convert source file(s)
+				to a more compact video format, as needed, into current dir.
+			Encodes to av1/opus/mkv, downscaling to ~720p30b10/96k-stereo.
+			Initial ffprobe is intended to detect files that might already be
+				converted or won't benefit from it as much, and skip those by default,
+				as well as any files that can't be handled by this script/settings
+				correctly (e.g. ones that have multiple A/V streams or errors of any kind).
+			Does not run conversion by default, only prints ffmpeg commands to do it.'''))
+	parser.add_argument('src', nargs='+', help='File(s) to convert.')
+
+	group = parser.add_argument_group('General modes of operation')
+	group.add_argument('-x', '--convert', action='store_true', help=dd('''
+		Run ffmpeg commands to convert all files not
+			listed as PROBLEM or SKIP (unless -f/--force is used).'''))
+	group.add_argument('-n', '--skip-n', metavar='n', type=int, help=dd('''
+		Skip first N files that'd have been processed otherwise.
+		Can be used to resume a long operation, using number from
+			"wc -l" on -r/--rm-list or printed n/m count between/after ffmpeg runs.'''))
+	group.add_argument('-N', '--skip-existing', action='store_true', help=dd('''
+		Skip any already-existing files that script was meant to create, in the same way
+			as -n/--skip-n option does, counting those as already done for stats purposes.'''))
+	group.add_argument('-p', '--print-probe', action='store_true', help=dd('''
+		Print information about contents of each file relevant to this script.
+		Normally this info is only printed for files with some kind of processing issues.
+		For full data use: ffprobe -v error -show_entries stream:format -of json <file>'''))
+	group.add_argument('-q', '--quiet', action='store_true', help=dd('''
+		Don't print WARN/SKIP info about minor issues or files
+			that seem to be encoded adequately, or stream info on any errors.'''))
+	group.add_argument('-w', '--wait',
+		metavar='timeout [/ check-interval] [~ stale-delay]', help=dd('''
+			Wait for all source file(s) to appear before running any kind of probes/processing.
+			Timeout value will be divided into <60 exponentially-spaced checks,
+				with min interval of 3s, and optional explicitly-specified check-interval.
+			Stale delay option checks that mtime is older, i.e. file is finished writing.
+			Wait/iterval/delay can be a number of seconds or [[HH:]MM:]SS[.MS] or short time-delta
+				like "30s", "10min", "1h 20m", "1d12h5m". Intended for downloads or proc-pipelines.
+			Implies -x/--convert. Can be aborted after file(s) appear due to w/e quirks,
+				so might be a good idea to double-check formats and all processing-related opts.'''))
+	group.add_argument('-E', '--extract-attachments', metavar='dir', help=dd('''
+		Detect/extract all attachment blobs (usually subtitle fonts)
+			from files to specified existing dir and exit instead of converting anything.
+		Keeps exact filenames as used in each file and checks that same-name attachments
+			are identical (incl. with files already in specified dir), with warnings otherwise.
+		When used with -f/--force option, replaces files on checksum mismatches.'''))
+
+	group = parser.add_argument_group('Processing tweaks')
+	group.add_argument('-f', '--force', action='store_true', help=dd('''
+		Also process files marked as SKIP, i.e. ones that don't seem to need it.'''))
+	group.add_argument('-1', '--use-stream1', action='store_true', help=dd('''
+		Process files with multiple A/V streams, encoding first stream from those.'''))
+	group.add_argument('-a', '--audio-n', metavar='n', help=dd('''
+		Index of audio stream to use for all files, with -a1 to use first stream (same as -1).
+		Special 'a' or 'all' value can be used to keep all audio streams.
+		Overrides -1/--use-stream1 for audio, if both options are used together.'''))
+	group.add_argument('-A', '--audio-tag', metavar='key=value', help=dd('''
+		Similar to --audio-n, but selects audio stream by its metadata tag, e.g. "language=eng".
+		If used together with --audio-n, SKIPs the file on stream number/tag mismatch.
+		Run with -p/--print-probe option to get info on streams and their tags in input files.'''))
+	group.add_argument('-t', '--copy-attachments', action='store_true', help=dd('''
+		Copy all "attachment" blobs, like subtitle fonts and such.'''))
+	group.add_argument('-F', '--fn-opts', action='store_true', help=dd('''
+		Apply and strip ffmpeg params stored in filenames.
+		If filename has ".tomkv<opts>." before file extension, it'll be parsed and removed.
+		Where "<opts>" part can have any number of following options, concatenated:
+			+ss=<time> - translated to "-ss <time>" for ffmpeg command.
+			+to=<time> - "-to <time>" for ffmpeg - stop time to cut video short at.
+		Filename example: video.tomkv+ss=1:23+to=4:56.mp4'''))
+
+	group = parser.add_argument_group('File naming/paths/metadata')
+	group.add_argument('-X', '--inplace', action='store_true', help=dd('''
+		Use destination filename directly instead of temporary files for conversion.'''))
+	group.add_argument('--name',
+		metavar='tpl', default='{name}.mkv', help=dd('''
+			Template to rename resulting file(s), instead of default: %(default)s
+			Can be used to set non-mkv container format, e.g. mp4.
+				ffmpeg auto-detects it from extension, so it must be something conventional.
+			Names are deduplicated with number-suffix when multiple sources are used.
+			Substituted keys: "name" - source filename without extension.'''))
+	group.add_argument('-T', '--dst-dir', metavar='path', help=dd('''
+		Existing path to store resulting files in. Defaults to current dir.'''))
+	group.add_argument('--copy-mtime', action='store_true', help=dd('''
+		Set same modification time on the converted file after ffmpeg finishes.
+		Only works with -x/--convert flag, does nothing otherwise.'''))
+
+	group = parser.add_argument_group('Make a list of converted files')
+	group.add_argument('-r', '--rm-list', metavar='file[:ratio]', help=dd('''
+		Generate a list of files to cleanup after conversion, one per line.
+		It will have realpath of all source files by default, unless ratio number
+			(float in 0-1.0 range) is also specified, colon-separated after filename.
+		With ratio number, filename on the list is picked
+			from either source or destination after each operation,
+			based on resulting filesize difference - source if
+			resulting size is larger than source*ratio, otherwise destination.
+		Intended use is to make an easy-to-use list of files to
+			rm when replacing old ones with converted versions,
+			without unnecessary replacement if there's not enough benefit.
+		Specified list file is always overwritten.'''))
+	group.add_argument('-R', '--rm-list-regen', action='store_true', help=dd('''
+		When using -n/--skip-n or similar options,
+			still check file sizes when they exist, and put them on the list.
+		Can be used to make -r/--rm-list with new compression ratio target,
+			by re-running script at any time with -n/--skip-n covering processed files.'''))
+
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	## Wait for source files if necessary
+	if opts.wait:
+		try: tds = dict( (pre, td.strip())
+			for pre, td in re.findall(r'(^|[/~])([^/~]+)', opts.wait) ); tds['']
+		except: parser.error('-w/--wait should be: timeout [/ interval] [~ stale-delay]')
+		opts.convert, tds = True, dict((k, td_parse(v)) for k, v in tds.items())
+		delay_min, span, delay_mtime = 3, tds[''], tds.get('~')
+		if interval := tds.get('/'):
+			delays = list()
+			while sum(delays) < span: delays.append(interval)
+		else:
+			n = min(60, round(span) / (delay_min * 1.3))
+			if span < delay_min * 4: delay_min, n = 0, 5 # for quicker initial checks
+			delays = retries_within_timeout(n, span, delay_min)
+	while True:
+		src_list = list()
+		for src in opts.src:
+			try:
+				src = pl.Path(src)
+				if ( opts.wait and delay_mtime
+					and (time.time() - src.stat().st_mtime) < delay_mtime ): break
+				src_list.append((src, srcx := src.resolve(strict=True)))
+			except FileNotFoundError:
+				if opts.wait: break
+				parser.error(f'Source path missing/inaccessible: {src}')
+			if '\n' in f'{src} {srcx}': parser.error(f'Source path with newline in it: {src!r}')
+		else: break # all files found
+		if delays: time.sleep(delays.pop()); continue
+		parser.error('Missing source file(s) after -w/--wait timeout expired')
+
+	## Misc init stuff
+	if opts.dst_dir: os.chdir(opts.dst_dir)
+	if rm_list := opts.rm_list:
+		rm_list, rm_list_ratio = ( (rm_list, math.inf)
+			if ':' not in rm_list else rm_list.rsplit(':', 1) )
+		rm_list, rm_list_ratio = open(rm_list, 'w'), float(rm_list_ratio)
+	nx, sx, pxfmts_10b = max(0, opts.skip_n or 0), opts.skip_existing, parse_rgb10_pixfmts()
+	vn, atts = bool(opts.use_stream1), opts.copy_attachments
+	an = ( bool(opts.use_stream1) if not opts.audio_n
+		else (None if opts.audio_n.lower() in ['a', 'all'] else int(opts.audio_n)) )
+	try: at = opts.audio_tag and opts.audio_tag.lower().split('=', 1)
+	except: parser.error(f'Invalid -A/--audio-tag format: {opts.audio_tag!r}')
+	else: at = at and dict([at])
+
+	def _err_fail(errs, fail_desc=None, skip=False, quiet=False):
+		if not errs: return
+		try: fail = err = next(err for err in errs if not err.get('warn'))
+		except: err = errs[fail := 0]
+		if not quiet: # doesn't affect fail_desc output
+			err_verdict = lambda: ( 'PROBLEM' if err.get('fatal')
+				else ('WARN' if err.get('warn') or skip else 'SKIP') )
+			if len(errs) > 1:
+				print(f'\n{src.name} :: {err_verdict()}')
+				for err in errs: print(f'  {err_verdict()} {err.get("t") or "-"} :: {err.msg}')
+			else: print(f'\n{src.name} :: {err_verdict()} {err.get("t") or "-"} :: {err.msg}')
+		if skip or not fail: return
+		if fail_desc: print('\n' + tw.indent(fail_desc, '  ') + '\n')
+		return fail
+
+	## Extract-attachments mode
+	if dst_dir := opts.extract_attachments:
+		if not (p_dst := pl.Path(dst_dir)).is_dir():
+			return err_func(f'Missing directory for -E/--extract-attachments [ {dst_dir} ]')
+		return ffmpeg_extract_atts(src_list, p_dst, opts.force, opts.quiet)
+
+	## ffprobe checks
+	for n, (src, srcx) in enumerate(src_list):
+		src_list[n] = None # default-skip files, unless they pass all checks below
+		try: p = src_probe(srcx, vn, an, at, atts, pxfmts_10b)
+		except Exception as err: p = adict( t='probe', fatal=1,
+			msg=f'Failed to process media info: [{err.__class__.__name__}] {err}' )
+		else: # parse fnopts, format dst filename
+			fn = (opts.name or '{name}.mkv').format(name=src.name.rsplit('.', 1)[0])
+			p.fn, p.ext = fn.rsplit('.', 1) if '.' in fn else (fn, '')
+			if opts.fn_opts and (m := re.search(r'\.tomkv(\+\S+)?\Z', p.fn)):
+				p.fn, fnopts = fn[:m.start()], m[1] or ''
+				try:
+					p.opts = dict(opt.split('=', 1) for opt in fnopts.split('+') if opt)
+					if set(p.opts) - {'ss', 'to'}: raise ValueError
+				except: p.errs.append(adict( t='file', fatal=1,
+					msg=f'Failed to parse -F/--fn-opts: {fnopts!r}' ))
+		# Last check for unfixable file/format issues
+		if (errs := p.get('errs', [p])) and _err_fail(
+			list(err for err in errs if err.get('fatal')),
+			not opts.quiet and p.get('desc') ): continue
+
+		# Check for warnings and skippable issues
+		p.v.scale, p.v.resample = p.v.w > 1400 or p.v.h > 1500, p.v.fps > 35
+		p.v.pxconv = p.v.pxf not in pxfmts_10b
+		if p.v.c in ['hevc', 'av1'] and not p.v.scale and not p.v.resample and p.v.br < 2.5e6:
+			errs.append(adict(t='video', msg=f'Already encoded to <1280x <30fps {p.v.c}'))
+		for a in p.a.enc: a.clone = a.c == 'opus' and a.cn <= 2
+		if all(a.clone for a in p.a.enc): errs.append(adict(
+			t='audio', warn=1, msg='Already encoded to ~2ch opus, will copy it as-is' ))
+		# Last check for non-fatal errors
+		if _err_fail(errs, opts.print_probe and p.desc, opts.force, opts.quiet): continue
+		src_list[n], p.src = p, srcx
+	if not (src_list := list(filter(None, src_list))):
+		parser.error('No non-skipped files to process')
+
+	## Deduplication of destination filenames
+	dst_name_map = dict()
+	for p in sorted(src_list, key=lambda p: (p.fn, str(p.src))):
+		p.tmp = p.dst = p.fn + (p.ext and f'.{p.ext}')
+		dst_name_map.setdefault(p.dst, list()).append(p)
+	for dst_name, ps in list(dst_name_map.items()):
+		nf = len(str(len(ps))) if (dedup := len(ps) > 1) else 1
+		for nf in range(nf, 50): # to fix secondary dups created by suffix
+			for n, p in enumerate(ps, 1):
+				if dedup:
+					fn = ('{}.{:0'+str(nf)+'d}{}').format(p.fn, n, p.ext and f'.{p.ext}')
+					if fn in dst_name_map: break
+					p.dst = p.tmp = fn
+				if not opts.inplace: p.tmp = f'_tmp.{p.tmp}'
+			else: break
+		else: parser.error(f'Destination filename deduplication failed for [ {dst_name} ]')
+
+	## Main ffmpeg conversion loop
+	dry_run, m = not opts.convert, len(src_list)
+	nx, ts0 = min(nx, m), time.monotonic()
+
+	sz_src_done = sz_src_proc = sz_dst_done = 0
+	def _skipped_stats_catchup(n):
+		nonlocal sz_src_done, sz_dst_done
+		if not isinstance(n, int): n, src_list = 2, [n] # file instead of path
+		for nc, pc in enumerate(src_list, 1):
+			if nc == n: break
+			try: sz_dst = os.stat(pc.dst).st_size
+			except FileNotFoundError: continue
+			sz_src_done += (sz_src := pc.sz); sz_dst_done += sz_dst
+			if rm_list and opts.rm_list_regen:
+				improved = sz_dst/sz_src < rm_list_ratio
+				print(pc.src if improved else pc.dst, file=rm_list)
+
+	if dry_run: print()
+	for n, p in enumerate(src_list, 1):
+		filters = list()
+		if p.v.resample: filters.append('fps=30')
+		if p.v.scale: filters.append(
+			"scale='if(gte(iw,ih),min(1280,iw),-2)"
+			":if(lt(iw,ih),min(1280,ih),-2)',setsar=1:1" )
+		if filters: filters = ['-filter:v', sh_str_dq(','.join(filters))]
+		if fnopts := p.get('opts'):
+			filters = sum(([f'-{k}', v] for k, v in fnopts.items()), []) + filters
+		if p.v.pxconv: filters.extend(['-pix_fmt', 'yuv420p10le'])
+
+		ac = list()
+		for a in p.a.enc:
+			if a.clone: ac.append(adict(c='copy')); continue
+			ac.append(ax := adict(c='libopus', b='96k'))
+			if a.cn == 6: ax.filter = ( # -ac2 discards sw channel
+				'pan=stereo|c0=0.5*c2+0.707*c0+0.707*c4+0.5*c3'
+				'|c1=0.5*c2+0.707*c1+0.707*c5+0.5*c3,volume=2.0' )
+			elif a.cn > 2: ax.ac = '2'
+		ac = sum( ([f'-{k}:a', v] for k, v in ax.pop()) # uniform -c:a ...
+			if len(ax := set(tuple(v.items()) for v in ac)) == 1 else
+			([f'-{k}:a:{n}', v] for n, ax in enumerate(ac) for k, v in ax.items()), [])
+
+		fmt = ['-movflags', '+faststart'] if p.ext.lower() in ['mp4', 'mov', 'm4v'] else []
+		if vn or an or at or p.s or p.atts:
+			fmt.extend(( '-map', f'0:v:{max(p.v.n-1,0)}',
+				'-map', '0:a' if an is None else f'0:a:{max(p.a.n-1,0)}' ))
+			if subs := p.s.copy():
+				if subs == list(range(subs[-1] + 1)): fmt.extend(['-map', '0:s']); subs.clear()
+				for sn in subs: fmt.extend(['-map', f'0:s:{sn}'])
+			if p.atts: fmt.extend(['-map', '0:t'])
+
+		cmd = [ 'ffmpeg', '-hide_banner', '-i', str(p.src), *filters,
+			*'-c:v libsvtav1 -preset 5 -crf 38'.split(), *ac, *fmt, '-y', p.tmp ]
+
+		dt, ts1 = time.strftime('%Y-%m-%d %H:%M:%S'), time.monotonic()
+		msg = f'\n\n- {dt} --- [ {n} / {m} ] :: {td_repr(p.td)} :: {p.src} -> {p.dst}\n'
+		if n == nx and not dry_run: _skipped_stats_catchup(n+1)
+		if n <= nx: continue
+		if sx and os.path.exists(p.dst): _skipped_stats_catchup(p); continue
+		if dry_run: msg = msg.strip()
+		print(msg); print(' '.join(sh_repr(a) for a in cmd), end='\n\n', flush=True)
+		if opts.print_probe and p.desc: print(tw.indent(p.desc, '  ') + '\n', flush=True)
+		if dry_run: continue
+
+		sp.run( cmd, check=True,
+			env=dict(os.environ, SVT_LOG='2'), stdin=sp.DEVNULL )
+		if opts.copy_mtime: os.utime(p.tmp, (p.mtime, p.mtime), follow_symlinks=False)
+		if p.tmp != p.dst: os.rename(p.tmp, p.dst)
+
+		# Stats/rm-list for last processed file
+		target = ''
+		sz_src_done += (sz_src := p.sz); sz_src_proc += sz_src
+		sz_dst_done += (sz_dst := os.stat(p.dst).st_size)
+		if rm_list:
+			improved = sz_dst/sz_src < rm_list_ratio
+			print(p.src if improved else p.dst, file=rm_list, flush=True)
+			if rm_list_ratio is not math.inf:
+				target = 'better' if improved else 'WORSE'
+				target = f' [ {target} than {round(rm_list_ratio*100)}% target ]'
+		dt, td = time.strftime('%Y-%m-%d %H:%M:%S'), time.monotonic() - ts1
+		print( f'- {dt} --- [ {n} / {m} ] :: {p.dst}'
+			f' :: 100% -> {round(100*sz_dst/sz_src)}%{target}'
+			f' :: {sz_repr(sz_src)} -> {sz_repr(sz_dst)}'
+			f' :: encoded {td_repr(p.td)} in {td_repr(td)}, at {p.td/td:.2f}x speed' )
+
+		# Total stats and estimates
+		sz_src_left = sum(pc.sz for nc, pc in enumerate(src_list, 1) if nc > n)
+		sz_dst_left = sz_src_left * (sz_ratio := sz_dst_done/sz_src_done)
+		td_left = sz_src_left / (sz_src_proc / (td := time.monotonic() - ts0))
+		st = ( f'- --- Processed so far :: {sz_repr(sz_src_done)} ->'
+			f' {sz_repr(sz_dst_done)} [ {round(100*sz_ratio)}% ] in {td_repr(td)}' )
+		if nx: st += f', with first {nx} file(s) skipped on this run'
+		print(st)
+		if n == m: print('- --- all done', flush=True)
+		else: print(
+			f'- --- Left to process :: {m-n} file(s) / {sz_repr(sz_src_left)}'
+			f' -> additional ~{sz_repr(sz_dst_left)} in {td_repr(td_left)}'
+			f' (est. ~{sz_repr(sz_dst_done+sz_dst_left)} final total)', flush=True )
+
+if __name__ == '__main__': sys.exit(main())

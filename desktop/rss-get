@@ -2,7 +2,7 @@
 
 import urllib.request as ul, urllib.error as ule, urllib.parse as ulp
 import pathlib as pl, datetime as dt, subprocess as sp
-import os, sys, socket, re, unicodedata, math, time
+import os, sys, socket, re, unicodedata, math, calendar
 
 import feedparser as fp
 
@@ -84,13 +84,13 @@ def feed_entry_enclosures(entry, ext_filter=None):
 		enc_urls.append(enc_href)
 	return enc_urls
 
-def feed_entry_ts(entry):
+def feed_entry_ts(entry, raw=False):
 	'Return tuple of (raw, parsed) timestamps for entry, latter one in datetime format.'
 	for k in 'published created modified'.split():
 		if not entry.get(k): continue
 		ts, ts_str = entry[f'{k}_parsed'], entry[k]
-		if ts: # not sure if timezone is discarded here, shouldn't matter
-			ts = dt.datetime.fromtimestamp(time.mktime(ts))
+		if ts: ts = dt.datetime.fromtimestamp(calendar.timegm(ts))
+		if not raw: ts_str = ts.strftime(' %Y-%m-%d %H:%M %a ')
 		break
 	else: ts = ts_str = None
 	return ts_str, ts
@@ -99,7 +99,7 @@ def feed_entry_ts(entry):
 _name_subs = {
 	r'[\\/]': '_', r'^\.+': '_', r'[\x00-\x1f]': '_', r':': '-_',
 	r'<': '(', r'>': ')', r'\*': '+', r'[|!"]': '-', r'[\?\*]': '_',
-	'[\'’]': '', r'\.+$': '_', r'\s+$': '', r'\s': '_', '#': 'N' }
+	'[\'’]': '', r'\.+\Z': '_', r'\s+\Z': '', r'\s': '_', '#': 'N' }
 def name_for_fs( name, fallback=...,
 		_name_subs=list((re.compile(k), v) for k,v in _name_subs.items()) ):
 	if not name and fallback is not ...: return fallback
@@ -107,7 +107,7 @@ def name_for_fs( name, fallback=...,
 	return name
 
 def name_dedup(name, name_set, n=3):
-	suff_n, suff_re, suff_fmt = 1, re.compile(r'\.x' + r'\d'*n + r'$'), f'.x{{:0{n}d}}'
+	suff_n, suff_re, suff_fmt = 1, re.compile(r'\.x' + r'\d'*n + r'\Z'), f'.x{{:0{n}d}}'
 	while name in name_set:
 		if m := suff_re.search(name): name = name.rsplit(m.group(0))[0]
 		name += suff_fmt.format(suff_n)
@@ -118,7 +118,7 @@ def name_dedup(name, name_set, n=3):
 
 def ts_diff_str( ts, ts0=None, ext=None, sep='',
 		_units=dict( h=3600, m=60, s=1,
-			y=365.25*86400, mo=30.5*86400, w=7*86400, d=1*86400 ) ):
+			y=365.2422*86400, mo=30.5*86400, w=7*86400, d=1*86400 ) ):
 	delta = abs(
 		(ts - (ts0 or dt.datetime.now()))
 		if not isinstance(ts, dt.timedelta) else ts )
@@ -188,6 +188,8 @@ def main(args=None):
 		help='List curl commands for downloading all selected files individually and exit.')
 	group.add_argument('-A', '--list-aria2', action='store_true',
 		help='Print filelist for downloading all selected files with aria2c and exit.')
+	group.add_argument('-T', '--print-raw-ts', action='store_true',
+		help='Print original timestamps as they are parsed from feed, not localized ones.')
 
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
@@ -197,7 +199,7 @@ def main(args=None):
 
 	ranges = list()
 	for v in opts.num or list():
-		m = re.search(r'^(\d+)(?:-(\d+))?$', v)
+		m = re.fullmatch(r'(\d+)(?:-(\d+))?', v)
 		if not m: parser.error(f'Invalid format for -n/--num option, should be N[-M]: {v!r}')
 		a, b = int(m.group(1)) or 1, int(m.group(2) or 0)
 		if not b: b = a
@@ -220,13 +222,13 @@ def main(args=None):
 	ts0, n0, file_urls = None, entries[0][0], dict()
 	for n, e in reversed(entries):
 		enc_urls = feed_entry_enclosures(e, opts.file_type)
-		ts_str, ts = feed_entry_ts(e)
+		ts_str, ts = feed_entry_ts(e, raw=opts.print_raw_ts)
 
 		if opts.list or not ranges:
 			if not opts.list:
 				ts0, ts_diff = ts, f' +{ts_diff_str(ts - ts0)}' if ts0 else None
 				ts_diff_last = f' -{ts_diff_str(ts)}' if n == n0 else None
-				print(f'--- [{n: 2d}] {e.title}')
+				print(f'--- [{n: >2d}] {e.title}')
 				print(f'    [{ts_str}]{ts_diff or ""}{ts_diff_last or ""}')
 				if url := e.get('link'): print(f'    {url}')
 				for url in enc_urls: print(f'    {url}')

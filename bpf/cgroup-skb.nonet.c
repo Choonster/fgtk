@@ -11,12 +11,9 @@
 //   /sys/fs/bpf/cgroup-skb-nonet type cgroup/skb
 //  (use "bpftool -d" to debug why stuff fails to load)
 
-
 #include <linux/version.h>
 #include <uapi/linux/bpf.h>
-
-// From /usr/src/linux/tools/testing/selftests/bpf/bpf_helpers.h
-#include "bpf_helpers.h"
+#include <bpf/bpf_helpers.h>
 
 
 #define ETH_P_IP 0x8
@@ -53,6 +50,7 @@ struct ipv6hdr {
 SEC("cgroup/skb")
 int drop_all_packets(struct __sk_buff *skb) {
 	// See: bpf-helpers(7), tc-bpf(8)
+	//   https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_CGROUP_SKB/
 	//   https://www.kernel.org/doc/Documentation/networking/filter.txt
 	//   https://github.com/iovisor/bcc/blob/master/docs/reference_guide.md
 

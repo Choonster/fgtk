@@ -1,34 +1,45 @@
 #!/bin/bash
 
-sz=1600
+sz=1920x1440
 
 usage() {
 	local bin=$(basename $0)
 	[[ $1 -eq 0 ]] || exec 1>&2
-	echo "Usage: $bin /path/to/some/image.jpg [size=$sz]"
+	echo "Usage: [SZ=$sz] $bin /path/to/some/image.jpg ..."
 	echo
-	echo "Size arg can be a size for square to fit image into, or WxH spec"
+	echo "SZ env-var can be a size for square to fit image into, or WxH spec"
 	echo "  for rectangle with max width/height. Scaling is always proportional."
+	echo "Uses imagemagick with jpg destination and quality=80, and jpegoptim on that."
 	exit ${1:-1}; }
 [[ "$1" = -h || "$1" = --help ]] && usage 0
-
-[[ -n "$1" && "$#" -le 2 ]] || usage 1
+[[ "$#" -ge 1 ]] || usage 1
 set -eo pipefail
 
 du_hs() {
-	local sz szp
-	read -ra sz szp < <(du -hs "$1" || kill -INT $$)
-	printf '%s' "$sz"; }
+	local du dup
+	read -ra du dup < <(du -hs "$1" || kill -INT $$)
+	printf '%s' "$du"; }
 
-p=$1
-[[ -e "$p" ]] || { echo >&2 "ERROR: nx input file - '$p'"; exit 1; }
-[[ ! -e "$p".fix.jpg ]] || {
-	echo >&2 "ERROR: temp-file from earlier bug - $p.fix.jpg"; exit 1; }
+[[ -z "$SZ" ]] || sz=$SZ
 [[ "$sz" == *x* ]] || sz="${sz}x${sz}"
 
-sz1=$(du_hs "$p")
-convert "$p" -resize "${sz}>" "$p".fix.jpg
-jpegoptim -q --strip-all --all-normal "$p".fix.jpg
-mv "$p".fix.jpg "$p"
-sz2=$(du_hs "$p")
-echo "$p :: $sz1 -> $sz2"
+for p in "$@"; do
+	[[ -e "$p" ]] || { echo >&2 "ERROR: nx input file - '$p'"; exit 1; }
+	[[ ! -e "$p".fix.jpg ]] || {
+		echo >&2 "ERROR: temp-file from earlier bug - $p.fix.jpg"; exit 1; }
+
+	du1=$(du_hs "$p")
+	magick "$p" -resize "${sz}>" -quality 80 "$p".fix.jpg
+	jpegoptim -q --strip-all --all-normal --force "$p".fix.jpg
+	touch -m --reference="$p" "$p".fix.jpg
+	mv "$p".fix.jpg "$p"
+
+	p0=$p ext="${p##*.}"
+	[[ "$ext" = jpg ]] && ext= || {
+		if [[ ${#ext} -gt 4 ]]
+		then echo >&2 "WARN: no proper filename.ext on [ $p ]"; ext=" :: $ext ???"
+		else p=${p%.*}.jpg; mv "$p0" "$p"; ext=" :: $ext -> jpg"; fi; }
+
+	du2=$(du_hs "$p")
+	echo "$p0 :: $du1 -> $du2$ext"
+done

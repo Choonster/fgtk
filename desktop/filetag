@@ -2,13 +2,13 @@
 
 import itertools as it, operator as op, functools as ft
 import pathlib as pl, collections as cs, contextlib as cl
-import os, sys, re, math, configparser, tempfile, time
+import os, sys, stat, re, math, configparser, tempfile, time
 
 p_err = lambda msg,*a,**k: print(msg, *a, **k, file=sys.stderr, flush=True)
 
 
 conf_path_default = '~/.filetag.ini'
-conf_example = '''
+conf_example = r'''
 ;;;; This is an example INI file with specific sections/options.
 ;; For format description and examples, see:
 ;;   https://docs.python.org/3/library/configparser.html#supported-ini-file-structure
@@ -79,28 +79,29 @@ tag_map = dict(
 	# Code formats
 	code_ext = {
 		'py|tac': 'py', 'go': 'go', r'c(c|pp|xx|\+\+)?|hh?|lex|y(acc)?': 'c',
-		r'js(o?n(\.txt)?)?|coffee': 'js', 'co?nf|cf|cfg|ini': 'conf',
+		r'js(o?n(\.txt)?)?|tsx?|coffee': 'js', 'co?nf|cf|cfg|ini': 'conf',
+		'nim': 'nim', 'ex|exs|erl|hrl': 'erlang',
 		'unit|service|taget|mount|desktop|rules': 'conf',
 		'[sx]?htm(l[45]?)?|css|less|jade': 'html', 'x[ms]l|xsd|dbk': 'xml',
 		'kml': 'kml', 'sgml|dtd': 'sgml',
 		'patch|diff|pat': 'diff', r'(ba|z|k|c|fi)?sh|env|exheres-\d+|ebuild|initd?': 'sh',
 		'sql': 'sql', 'p(l|m|erl|od)|al': 'perl', 'ph(p[s45t]?|tml)': 'php',
-		'[cej]l|li?sp|rkt|sc[mh]|stk|ss': 'lisp', 'el(\.gz)?': 'el', 'ml': 'ml ocaml',
+		'[cej]l|li?sp|rkt|sc[mh]|stk|ss': 'lisp', r'el(\.gz)?': 'el', 'ml': 'ml ocaml',
 		'hs': 'haskell', 'rb': 'ruby', 'lua': 'lua', 'awk': 'awk', 'tcl': 'tcl', 'java': 'java',
 		'mk?d|markdown': 'md', 're?st': 'rst', 'te?xt': 'txt', 'log': 'log',
 		'rdf': 'rdf', 'xul': 'xul', 'po': 'po', 'csv': 'csv',
 		'f(or)?': 'fortran', 'p(as)?': 'pascal', 'dpr': 'delphi', 'ad[abs]|ad[bs].dg': 'ada',
 		'ya?ml': 'yaml', r'jso?n(\.txt)?': 'json', 'do': 'redo', 'm[k4c]|a[cm]|cmake': 'make' },
 	code_ext_suff = r'(\.(in|tpl|(src-)?bak|old|tmp|\d+'
-		'|backup|default|example|sample|dist|\w+-new)|_t)*',
-	code_shebang = '(?i)^#!((/usr/bin/env)?\s+)?(/.*/)?(?P<bin>\S+)',
+		r'|backup|default|example|sample|dist|\w+-new)|_t)*',
+	code_shebang = r'(?i)^#!((/usr/bin/env)?\s+)?(/.*/)?(?P<bin>\S+)',
 	code_bin = {
-		'lua[-\d.]': 'lua', 'php\d?': 'php',
-		'j?ruby(\d\.\d)?|rbx': 'ruby',
-		'[jp]ython(\d(\.\d+)?)?': 'py',
-		'[gnm]?awk': 'awk',
-		'(mini)?perl(\d(\.\d+)?)?': 'perl',
-		'wishx?|tcl(sh)?': 'tcl',
+		r'lua[-\d.]': 'lua', r'php\d?': 'php', r'node': 'js',
+		r'j?ruby(\d\.\d)?|rbx': 'ruby',
+		r'[jp]ython(\d(\.\d+)?)?': 'py',
+		r'(mini)?perl(\d(\.\d+)?)?': 'perl', r'java': 'js',
+		r'stack': 'haskell', r'ocamlscript': 'ml ocaml',
+		'wishx?|tcl(sh)?': 'tcl', '[gnm]?awk': 'awk',
 		'scm|guile|clisp|racket|(sb)?cl|emacs': 'lisp',
 		'([bdo]?a|t?c|k|z)?sh': 'sh' },
 	code_path = {
@@ -200,9 +201,9 @@ class FileTreeTagger:
 			elif isinstance(v, dict):
 				taggers = tag_map[k] = list()
 				for rx, tags in v.items():
-					if k == 'code_ext': rx = rf'\.({rx}){code_ext_suff}$'
-					elif k == 'bin_ext': rx = rf'(?i)\.({rx}){bin_ext_suff}$'
-					elif k == 'code_bin': rx = rf'^{rx}$'
+					if k == 'code_ext': rx = rf'\.({rx}){code_ext_suff}\Z'
+					elif k == 'bin_ext': rx = rf'(?i)\.({rx}){bin_ext_suff}\Z'
+					elif k == 'code_bin': rx = rf'^{rx}\Z'
 					tags = tags.split()
 					tag_set.update(tags)
 					taggers.append((re.compile(rx), tags))
@@ -235,6 +236,7 @@ class FileTreeTagger:
 				if rx.search(p_str): tagset.update(tags)
 		if not tagset: # code shebang
 			try:
+				if not stat.S_ISREG(p.stat().st_mode): raise OSError
 				with p.open('rb', 255) as src:
 					os.posix_fadvise(src.fileno(), 0, 256, os.POSIX_FADV_NOREUSE)
 					shebang = src.readline(200).decode().strip()
@@ -260,9 +262,6 @@ class ConfDict(cs.UserDict):
 def main(args=None):
 	import argparse, textwrap
 	dd = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
-	fill = lambda s,w=90,ind='',ind_next='  ',**k: textwrap.fill(
-		s, w, initial_indent=ind, subsequent_indent=ind if ind_next is None else ind_next, **k )
-
 	parser = argparse.ArgumentParser(
 		usage='%(prog)s [options] [-u|--update] [ tags... ]',
 		formatter_class=argparse.RawTextHelpFormatter,
@@ -275,8 +274,7 @@ def main(args=None):
 			https://www.dcode.fr/boolean-expressions-calculator
 		Returned paths are ordered by stored modification time values.'''))
 	parser.add_argument('-c', '--conf',
-		action='append', metavar='path', default=list(),
-		help=dd(f'''
+		action='append', metavar='path', default=list(), help=dd(f'''
 			Path to configuration file, specifying db file and paths to process.
 			Use "--conf help" to print example config with all supported options.
 			Can be specified multiple times, with values in later files overriding earlier ones.
@@ -287,8 +285,8 @@ def main(args=None):
 		help='Build/update tag database for all configured paths.')
 	group.add_argument('-v', '--verbose', action='store_true',
 		help='Print all files being processed and precise timestamps for benchmarking.')
-	group.add_argument('--nice', metavar='[prio:][io-class[.io-level]]', default='15:idle',
-		help=dd('''
+	group.add_argument('--nice',
+		metavar='[prio:][io-class[.io-level]]', default='15:idle', help=dd('''
 			Set "nice" and/or "ionice" (CFQ I/O) priorities.
 			"nice" prio value, if specified, must be
 				in -20-20 range, where lower = higher prio, and base=0.
@@ -354,45 +352,48 @@ def main(args=None):
 			raise
 		else: p_db_tmp.rename(p_db)
 
-	if opts.tags:
-		print_func = lambda *line: print(*line, end='\n' if not opts.print0 else '\0')
-		try:
-			with TagDB(p_db) as db:
+	if not opts.tags: return
 
-				if not opts.path:
-					tagsets = list(set(ts.split('+')) for ts in ' '.join(opts.tags).split())
-					for p_str in db.lookup_tags(tagsets):
-						if opts.existing and not os.path.exists(p_str): continue
-						print_func(p_str)
+	print_func = lambda *line: print(*line, end='\n' if not opts.print0 else '\0')
+	with TagDB(p_db) as db:
 
-				else:
-					paths = set()
-					for p_str in opts.tags:
-						p = pl.Path(p_str).resolve()
-						if opts.existing and not p.exists(): continue
-						paths.add(str(p))
-					for p_str, tags in db.lookup_paths(paths):
-						print_func(p_str, '::', ' '.join(tags))
-						paths.remove(p_str)
-					if paths: # check if tags are missing due to filtering lists
-						for p_str in paths:
-							for p_scan in p_scan_list:
-								p = str(p_scan.resolve())
-								if not p_str.startswith(f'{p}/'): continue
-								p_str = p_str[len(p):]
-								break
-							else: continue # can still be a symlink, but whatever
-							p_chunks = p_str.split('/')
-							for n in range(1, len(p_chunks)):
-								p_dir = '/'.join(p_chunks[:n]) + '/'
-								if not path_filter.check(p_dir):
-									p_err( f'{p_str}: parent dir {p_dir!r}'
-										f' is ignored due to filtering (scan root: {p_scan})' )
-									break
-							else:
-								if not path_filter.check(p_str):
-									p_err('{p_str}: path ignored due to filtering (scan root: {p_scan})')
+		if not opts.path:
+			tagsets = list(set(ts.split('+')) for ts in ' '.join(opts.tags).split())
+			for p_str in db.lookup_tags(tagsets):
+				if opts.existing and not os.path.exists(p_str): continue
+				print_func(p_str)
+			return
 
-		except BrokenPipeError: return
+		paths = set()
+		for p_str in opts.tags:
+			p = pl.Path(p_str).resolve()
+			if opts.existing and not p.exists(): continue
+			paths.add(str(p))
+		for p_str, tags in db.lookup_paths(paths):
+			print_func(p_str, '::', ' '.join(tags))
+			paths.remove(p_str)
+		if not paths: return
 
-if __name__ == '__main__': sys.exit(main())
+		for p_str in paths: # check if tags are missing due to filtering lists
+			for p_scan in p_scan_list:
+				p = str(p_scan.resolve())
+				if not p_str.startswith(f'{p}/'): continue
+				p_str = p_str[len(p):]
+				break
+			else: continue # can still be a symlink, but whatever
+			p_chunks = p_str.split('/')
+			for n in range(1, len(p_chunks)):
+				p_dir = '/'.join(p_chunks[:n]) + '/'
+				if not path_filter.check(p_dir):
+					p_err( f'{p_str}: parent dir {p_dir!r}'
+						f' is ignored due to filtering (scan root: {p_scan})' )
+					break
+			else:
+				if not path_filter.check(p_str):
+					p_err('{p_str}: path ignored due to filtering (scan root: {p_scan})')
+
+if __name__ == '__main__':
+	try: sys.exit(main())
+	except BrokenPipeError: # stdout pipe closed
+		os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+		sys.exit(1)

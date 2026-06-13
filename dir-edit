@@ -1,0 +1,344 @@
+#!/usr/bin/env python
+
+import pathlib as pl, hashlib as hl, contextlib as cl, subprocess as sp
+import os, sys, re, base64, tempfile, enum, datetime as dt
+import errno, termios, fcntl, select, struct, time, ctypes as ct # for inotify stuff
+
+
+class DirEditConf:
+	ed_wait, ed = True, (ed := os.environ.get('EDITOR')) and [ed]
+	tag = rec = rm = files = symlinks = replace = dry_run = diff_cmd = print = False
+
+
+p_out = lambda *a,**kw: print(*a, **kw, flush=True)
+p_err = lambda *a,**kw: print(*a, **kw, file=sys.stderr, flush=True) or 1
+
+def str_hash(s, c=None, key='dir-edit', strip=''):
+	s_raw, s = s, base64.urlsafe_b64encode(
+		hl.blake2s(str(s).encode(), key=key.encode()).digest() ).decode()
+	if not isinstance(strip, dict): strip = dict.fromkeys(map(ord, strip + '-_='))
+	s = s.translate(strip)
+	if c is None: return s
+	for n in range(30): # limit is to avoid unlikely a -> ... -> a loops
+		if len(s) < c: s = str_hash(s, c, key, strip)
+		if len(s) >= c: break
+	else: raise RuntimeError(f'str_hash() failed on: {s_raw!r} {[c, key, strip]}')
+	return s[:c]
+
+
+class INotify:
+	_lib = None
+	@classmethod
+	def _lib_init(c): c._lib = c._lib or ct.CDLL('libc.so.6', use_errno=True)
+	def _call(self, func, *args, noerrs=False):
+		if isinstance(func, str): func = getattr(self._lib, func)
+		while True:
+			if (res := func(*args)) == -1:
+				if (err := ct.get_errno()) == errno.EINTR: continue
+				elif noerrs: return
+				else: raise OSError(err, os.strerror(err))
+			return res
+	def __init__(self): self._lib_init()
+
+	def read_events(self, fd, _ev=struct.Struct('iIII')):
+		bs = ct.c_int(); fcntl.ioctl(fd, termios.FIONREAD, bs)
+		if bs.value <= 0: return
+		buff = os.read(fd, bs.value); n, bs = 0, len(buff)
+		while n < bs:
+			wd, flags, cookie, ns = _ev.unpack_from(buff, n); n += _ev.size
+			name = ct.c_buffer(buff[n:n+ns], ns).value.decode(); n += ns
+			yield name
+		if n != bs: p_err(
+			'WARNING: Unused trailing bytes on inotify-fd [{}]: {}'
+			.format((bs := bs - n), ct.c_buffer(buff[n:], bs).value) )
+
+	def watch_file_and_stdin(self, p, debounce=None):
+		tsx, fd, ep = 0, self._call('inotify_init'), select.epoll()
+		try: # inotify watch-flags: modify=0x02 moved_to=0x80
+			wd = self._call('inotify_add_watch', fd, bytes(p.parent), 0x02 | 0x80)
+			ep.register(fd); ep.register(0, select.EPOLLIN)
+			while True:
+				if (td := tsx and tsx - time.monotonic()) < 0: return
+				if not ((ev := ep.poll(td or None, 1)) and ev[0][0]): return
+				for name in self.read_events(fd):
+					if name != p.name or not (done := (yield)): continue
+					if not debounce: return
+					tsx = time.monotonic() + debounce
+		finally: ep.close(); os.close(fd)
+
+
+class fn_str(str): __slots__ = 'tag',
+
+def plist_make_dir(conf, pp):
+	pset = set()
+	for pd, fns_dir, fns_file in pp.walk(follow_symlinks=conf.symlinks):
+		pd = pd.relative_to(pp)
+		if not conf.rec:
+			if not conf.files: pset.update(fn_str(f'{p}/') for p in fns_dir)
+			fns_dir.clear()
+		elif not conf.files and str(pd) != '.': pset.add(fn_str(f'{pd}/'))
+		pset.update(fn_str(pd / fn) for fn in fns_file)
+	return pset
+
+def plist_make(conf, *paths):
+	if not paths: pset = plist_make_dir(conf, pl.Path())
+	else:
+		pset, pd = set(), pl.Path().resolve(strict=True)
+		for p in map(pl.Path, paths):
+			with cl.suppress(ValueError): p = p.resolve(strict=True).relative_to(pd)
+			if not p.is_dir(follow_symlinks=conf.symlinks): pset.add(fn_str(p)); continue
+			if not conf.files: pset.add(fn_str(f'{p}/'))
+			if conf.rec: pset.update(fn_str(f'{p}/{fn}') for fn in plist_make_dir(conf, p))
+	if conf.tag:
+		for n in range(100):
+			tags = set()
+			for fn in pset:
+				fn.tag = str_hash(fn, 4 + n // 20).lower()
+				if fn.tag in tags: break
+				tags.add(fn.tag)
+			else: break
+		else: raise RuntimeError('BUG - filename hash-tagging failed')
+	return sorted(pset)
+
+
+def plist_edit(plist_path, plist_str, ed, ed_wait, info=''):
+	if ed:
+		ed = sp.Popen([*ed, plist_path]); info and p_out(info)
+		if ed_wait: ed.wait(); return plist_str == plist_path.read_text()
+	return True
+
+def plist_wait_for_edits(plist_path, plist_str):
+	plist_updated = p_out('  -- waiting for file-list changes... [Enter to skip]')
+	plist_iter = INotify().watch_file_and_stdin(plist_path, debounce=0.3)
+	while True:
+		try: plist_iter.send(plist_updated) # skips metadata-only changes
+		except StopIteration: break
+		plist_updated = plist_str != plist_path.read_text()
+
+def plist_edits_prompt( plist_path, plist_str, diff_cmd, prompt_ext='',
+		_act=enum.Enum('InputAction', 'apply editor reload wait quit'),
+		_tmp=lambda pre,suff: tempfile.NamedTemporaryFile('w', prefix=pre, suffix=suff) ):
+	dt_now = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	p_out(f'\n[ {dt_now} ] Diff for file-list update{prompt_ext}:')
+	plist_fn_base = plist_path.name.rsplit('.', 1)[0] + '.'
+	plist_str_new = plist_path.read_text()
+	with _tmp(plist_fn_base, '.txt.old') as a, _tmp(plist_fn_base, '.txt.new') as b:
+		a.write(plist_str); b.write(plist_str_new); a.flush(); b.flush()
+		sp.run([*diff_cmd, a.name, b.name])
+	while True:
+		try: cmd = input( f'QUERY{prompt_ext}: [A]pply changes, [R]eload, call'
+			' [E]ditor again, [W]ait for more edits, [Q]uit/e[X]it :: ' ).lower().strip() or '-'
+		except EOFError: continue
+		for act in 'apply editor reload wait quit xit exit'.split():
+			if act.startswith(cmd): break
+		else: continue
+		if act in ['xit', 'exit']: act = 'quit'
+		act = _act[act]; act.plist_str = plist_str_new; return act
+
+
+def plist_edits_parse(plist, plist_str, tags=False, rm=False):
+	tag_idx, mvs, rms = dict(), list(), list()
+	if tags:
+		for n, fn in enumerate(plist): tag_idx[fn.tag] = n
+	if len(lines := plist_str.splitlines()) != len(plist) and not tags:
+		raise RuntimeError('Edited file-list does not match same length exactly')
+	for n, ln in enumerate(lines):
+		if tags:
+			if ( not (m := re.fullmatch(r'(.*?)\s+#(\S+)', ln))
+					or (nn := tag_idx.get(tag := m[2].lower())) is None ):
+				p_err(f'SKIP: Failed to match line-{n} as "name #tag": {ln!r}'); continue
+			if not isinstance(nn, int): raise RuntimeError( 'Duplicate lines'
+				f' for tag #{tag}\n  line-{nn[0]} :: {nn[1]}\n  line-{n} :: {ln}' )
+			fn, ln, tag_idx[tag] = plist[nn], m[1], (n, ln)
+		else: fn = plist[n]
+		if (fn := fn.rstrip('/')) != (ln := ln.rstrip('/')): mvs.append((fn, ln))
+	if rm:
+		for tag, nn in tag_idx.items():
+			if isinstance(nn, int): rms.append(plist[nn].rstrip('/'))
+	return mvs, rms
+
+def plist_edits_sanity_check(plist, mvs, rms, replace=False):
+	errs, src_moved, dst_files = False, set(), set(plist).difference(rms)
+	for a, b in mvs:
+		dst_files.discard(a); src_moved.add(a)
+		if not replace:
+			if b in dst_files or ( b not in rms
+					and b not in src_moved and pl.Path(b).exists(follow_symlinks=False) ):
+				errs = p_err(f'ERROR: Filename conflict detected [ {b} ]')
+			dst_files.add(b)
+		try: bd_st = pl.Path(b).parent.lstat()
+		except FileNotFoundError:
+			errs = p_err(f'ERROR: Destination dir missing for rename [ {a} ] -> [ {b} ]')
+		else:
+			if (a_st := os.lstat(a)).st_dev != bd_st.st_dev:
+				errs = p_err(f'ERROR: Cross-device rename [ {a} ] -> [ {b} ]')
+			if a_st.st_ino == bd_st.st_ino:
+				errs = p_err(f'ERROR: Moving dir into itself [ {a} ] -> [ {b} ]')
+	for p in rms:
+		if pl.Path(p).is_dir(follow_symlinks=False):
+			errs = p_err(f'ERROR: Will not remove directory [ {p} ]')
+	if not errs: return True
+
+
+def main(args=None, conf=None):
+	if not conf: conf = DirEditConf()
+	if not conf.ed: ed_info = 'unset'
+	else: ed_info = f'set to {conf.ed[0]}'
+
+	import argparse, textwrap
+	dd = lambda text: re.sub( r' \t+', ' ',
+		textwrap.dedent(text).strip('\n') + '\n' ).replace('\t', '  ')
+	parser = argparse.ArgumentParser(
+		formatter_class=argparse.RawTextHelpFormatter,
+		usage='%(prog)s [options] [paths...]', description=dd(f'''
+			Make a consistent list of file/dir/etc names in current dir, one per line,
+				open it in $EDITOR (currently {ed_info}) to edit filenames there,
+				wait for it, show diff and prompt to apply renames as per edits in that list.
+			Intended to be a convenient interactive multi-rename tool.
+
+			Names in the list should not be reordered or removed without -t/--tag option.
+			Reloads file-list after changes or when asked in console,
+				checks that it's still same before applying renames or prompts again.
+			Safe by default - never removes or replaces anything, never applies
+				any changes without explicit confirmation, has some sanity checks.
+			More dangerous operations have to be enabled via command-line options.'''))
+
+	group = parser.add_argument_group('What to include on the file-list')
+	group.add_argument('paths', nargs='*', default=list(), help=dd('''
+		Path(s) to rename. Default is to rename all files/dirs in the current directory.
+		Relative paths (like filenames) can be used, absolute paths
+			under current dir will be converted and listed as relative paths.
+		Paths outside current dir will be on the list under absolute "realpath" name.'''))
+	group.add_argument('-d', '--dir', metavar='path', help=dd('''
+		Directory to operate on, instead of the current one (cwd).
+		Any relative path arguments are interpreted relative to it, instead of cwd.'''))
+	group.add_argument('-F', '--files', action='store_true', help=dd('''
+		Don't include any directory names on the list,
+			only files and other non-dir entries, all symlinks included.
+		Common */ shell-expansion trick can be used to only rename dirs instead.'''))
+	group.add_argument('-r', '--recursive', action='store_true', help=dd('''
+		Generate file-list to rename recursively, similar to output of "find" tool.
+		This also allows to move files between directories on the list, although
+			all those must be within same filesystem, which is checked before renames.
+		Files are renamed in reverse order of the edited list,
+			so that filename changes would be done before parent dir renames.
+		All parent/destination directories must exist before renaming.'''))
+	group.add_argument('-s', '--symlinks', action='store_true', help=dd('''
+		Traverse dir symlinks if -r/--recursive mode is used (default is to not do that).
+		Can potentially lead to inifinite recursion if symlink points to one of its parent dirs.
+		In non-recursive mode, if -F/--files is used, also ignore symlinks pointing to dirs.'''))
+
+	group = parser.add_argument_group('Misc other options')
+	group.add_argument('-t', '--tag', action='store_true', help=dd('''
+		Add space-separated unique-id tag after each filename (looks like #SvqG),
+			so that lines in the list can be reordered or removed freely.
+		Tags in each line are case-insensitive, but should not be
+			changed/removed - script will generate a warning and skip that line.'''))
+	group.add_argument('--rm', action='store_true', help=dd('''
+		Remove all files which end up not being on the list.
+		Implies -t/--tag. Never removes directories.'''))
+	group.add_argument('--replace', action='store_true', help=dd('''
+		Replace files when detecting naming conficts instead of aborting operation.'''))
+	group.add_argument('--dry-run', action='store_true', help=dd('''
+		After confirming the diff, print all actions to be taken, but don't do anything.'''))
+	group.add_argument('--print',
+		action='store_true', help='Print file-list to stdout and exit.')
+
+	group = parser.add_argument_group('Commands to use')
+	group.add_argument('-e', '--ed', metavar='editor', help=dd('''
+		Editor command (split on spaces) to run with file-list argument, and wait for it to exit.
+		Can be prefixed by "+" (plus sign) to not wait for its exit and wait for file
+			changes instead, or can be just "+" without name/path to not wait for default $EDITOR.
+		Special "++" value (double plus) can be used to not
+			run anything, same as empty EDITOR= env-var will do by default.
+		Name of the file-list is always printed to stdout, can be copied from there.'''))
+	group.add_argument('--diff', metavar='cmd', help=dd('''
+		Diff command (split on spaces) to run for comparing pre/post edits file-lists.
+		Default - detect delta/colordiff tools, with "diff -uw" as a fallback.'''))
+
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	if ed := opts.ed:
+		if ed == '++': conf.ed_wait = conf.ed = ''
+		elif ed[0] == '+': conf.ed_wait, conf.ed = False, ed[1:] or conf.ed
+		else: conf.ed = ed
+		conf.ed = list(filter(None, conf.ed.split()))
+	if opts.rm: conf.tag = conf.rm = True
+	if opts.recursive: conf.rec = True
+	if opts.dir: os.chdir(opts.dir)
+	if opts.diff: conf.diff_cmd = opts.diff.split()
+	for k in 'tag files symlinks replace dry_run print'.split():
+		if getattr(opts, k, None): setattr(conf, k, True)
+
+	if not conf.print:
+		if not sys.stdin.isatty(): return p_err(
+			'ERROR: stdin is not connected a terminal - required for interactive prompts' )
+		dev_id = lambda f: (os.major(d := os.stat(os.ttyname(f.fileno())).st_dev), os.minor(d))
+		if dev_id(sys.stdin) != dev_id(sys.stdout): return p_err(
+			'ERROR: stdin/stdout are not connected to same tty - can be an issue for prompts' )
+		if not conf.diff_cmd:
+			import shutil
+			if shutil.which('delta'):
+				conf.diff_cmd = [ *( 'delta -n --diff-highlight'
+					' --paging=never --file-style=omit --keep-plus-minus-markers' ).split(),
+					'--hunk-label=@@ ', '--hunk-header-decoration-style=blue ul',
+					'--hunk-header-style=line-number' ]
+			elif shutil.which('colordiff'): conf.diff_cmd = ['colordiff', '-uw']
+			else: conf.diff_cmd = ['diff', '-uw']
+
+	for fn in (plist := plist_make(conf, *opts.paths)):
+		if '\n' in fn or fn != fn.strip(): return p_err(
+			f'ERROR: Filename with newline(s) or leading/trailing spaces [ {fn!r} ]' )
+	if not conf.tag: plist_str = ''.join(f'{fn}\n' for fn in plist)
+	else:
+		n = max(len(fn) for fn in plist)
+		plist_str = ''.join(f'{{0:<{n}s}}   #{{0.tag}}\n'.format(fn) for fn in plist)
+	if conf.print: sys.stdout.write(plist_str); return
+
+	## Create file-list, wait for editor/edits, confirm via prompt
+	ack, prompt_ext = False, '' if not conf.dry_run else ' [DRY-RUN]'
+	with tempfile.NamedTemporaryFile(
+			mode='w', dir='.', prefix='_dir-edit.', suffix='.txt' ) as plist_file:
+		plist_file.write(plist_str); plist_file.flush()
+		plist_path_rel = ( plist_path := pl.Path(plist_file.name)
+			.resolve(strict=True) ).relative_to(pl.Path().resolve(strict=True))
+		p_out(f'Created file-list to edit [ {len(plist):,d} lines ]: {plist_path_rel}')
+		wait = plist_edit( plist_path_rel, plist_str,
+			conf.ed, conf.ed_wait, f'  -- started editor for it [ {conf.ed[0]} ]' )
+		while True:
+			if wait: wait = plist_wait_for_edits(plist_path, plist_str)
+			act = plist_edits_prompt(plist_path, plist_str, conf.diff_cmd, prompt_ext)
+			if act is act.wait: wait = True; continue
+			elif act is act.reload: continue
+			elif act is act.quit: return
+			elif act is act.editor:
+				wait = plist_edit( plist_path_rel, plist_str,
+					conf.ed, conf.ed_wait, f'(Re-)Started editor [ {conf.ed[0]} ]' )
+				continue
+			elif act is act.apply:
+				if plist_path.read_text() != act.plist_str:
+					p_out('NOTE: File-list changed since last diff, repeating query...')
+					continue
+				ack = True; break
+			else: return p_err(f'BUG: Unrecognized action: {act}')
+	if not ack: return p_err('BUG: Wait-for-confirmation loop is broken')
+
+	## Parse and sanity-check all edits
+	try: mvs, rms = plist_edits_parse(plist, act.plist_str, tags=conf.tag, rm=conf.rm)
+	except RuntimeError as err: return p_err(f'ERROR: {err}')
+	if not plist_edits_sanity_check(plist, mvs, rms, replace=conf.replace): return 1
+
+	## Print/apply final changes
+	pre = f'{prompt_ext} '.lstrip(); p_out()
+	for p in rms:
+		p_out(f'{pre}Delete: [ {p} ]')
+		if not conf.dry_run: os.unlink(p)
+	for a, b in mvs:
+		msg = f'{pre}Rename: [ {a} ]\0-> [ {b} ]'
+		if len(msg) > 99: msg = msg.replace('\0', '\n' + ' '*(len(pre) + 5))
+		p_out(msg.replace(*'\0 '))
+		if not conf.dry_run: pl.Path(a).rename(b)
+
+if __name__ == '__main__':
+	try: sys.exit(main())
+	except KeyboardInterrupt: sys.exit(1)

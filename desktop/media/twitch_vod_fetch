@@ -2,11 +2,11 @@
 
 import itertools as it, operator as op, functools as ft
 import contextlib as cl, collections as cs, pathlib as pl
-import os, sys, argparse, logging, secrets, re, json, shutil
+import os, sys, argparse, logging, secrets, re, json, shutil, time
 import inspect, tempfile, enum, socket, signal, heapq, struct
 import asyncio, asyncio.subprocess as sp
 
-import aiohttp
+import aiohttp # https://aio-libs.org/projects/aiohttp/
 
 
 class TVFConfig:
@@ -17,7 +17,7 @@ class TVFConfig:
 	slice_scatter_interval = None
 
 	aria2c_opts = None # overrides opts in aria2_conf_func
-	ytdl_opts = None
+	ytdl_cmd = ytdl_opts = None
 	ytdl_output_format = None
 	aiohttp_opts = dict(
 		timeout=aiohttp.ClientTimeout(connect=60, sock_read=30) )
@@ -49,158 +49,96 @@ class TVFConfig:
 			'timeout=15',
 			'connect-timeout=10',
 			'lowest-speed-limit=100K',
-			f'user-agent={opts.ua}', '' ]
+			f'user-agent={opts.ua}' if opts.ua else '', '' ]
 		+ ([*self.aria2c_opts, ''] if self.aria2c_opts else []) )
 
 	aria2_term_wait = 10, 20 # (clean, term), clean should be >3s
 	aria2_startup_checks = 8, 10.0
 	aria2_queue_batch = 50
+	aria2_err_tbf = None
 	aria2_ws_heartbeat = 20.0
 	aria2_ws_debug = False # very noisy
 	aria2_ws_debug_signals = False
 
 
-class LogMessage:
-	def __init__(self, fmt, a, k): self.fmt, self.a, self.k = fmt, a, k
-	def __str__(self): return self.fmt.format(*self.a, **self.k) if self.a or self.k else self.fmt
-
-class LogStyleAdapter(logging.LoggerAdapter):
-	def __init__(self, logger, extra=None):
-		super(LogStyleAdapter, self).__init__(logger, extra or {})
-	def log(self, level, msg, *args, **kws):
-		if not self.isEnabledFor(level): return
-		log_kws = {} if 'exc_info' not in kws else dict(exc_info=kws.pop('exc_info'))
-		msg, kws = self.process(msg, kws)
-		self.logger._log(level, LogMessage(msg, args, kws), (), **log_kws)
-
-err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
-get_logger = lambda name: LogStyleAdapter(logging.getLogger(name))
-
-def add_stack_wrappers(cls):
-	def _make_wrapper(func):
-		async def _wrapper(self, *args, **kws):
-			async with cl.AsyncExitStack() as ctx:
-				return await func(self, ctx, *args, **kws)
-		return ft.wraps(func)(_wrapper)
-	for name, func in inspect.getmembers(cls, inspect.isroutine):
-		if name.startswith('__'): continue
-		sig = inspect.signature(func)
-		if ( len(sig.parameters) <= 1 or
-			list(sig.parameters.values())[1].annotation is not cl.AsyncExitStack ): continue
-		setattr(cls, name, _make_wrapper(func))
-	return cls
-
-
-it_adjacent = lambda seq, n, fill=None: it.zip_longest(fillvalue=fill, *([iter(seq)] * n))
-it_adjacent_nofill = lambda seq, n:\
-	( tuple(filter(lambda v: v is not it_adjacent, chunk))
-		for chunk in it_adjacent(seq, n, fill=it_adjacent) )
-
-class adict(dict):
-	def __init__(self, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-		self.__dict__ = self
+err_fmt = lambda err: f'[{err.__class__.__name__}] {err}'
 
 def log_lines(log_func, lines, log_func_last=False):
 	if isinstance(lines, str):
 		lines = list(line.rstrip() for line in lines.rstrip().split('\n'))
 	uid = secrets.token_urlsafe(3)
 	for n, line in enumerate(lines, 1):
-		if isinstance(line, str): line = '[{}] {}', uid, line
-		else: line = ['[{}] {}'.format(uid, line[0])] + list(line[1:])
+		if isinstance(line, str): line = '[%s] %s', uid, line
+		else: line = [f'[{uid}] {line[0]}', *line[1:]]
 		if log_func_last and n == len(lines): log_func_last(*line)
 		else: log_func(*line)
 
+def td_parse(td, _tds=dict(
+		d=1*86400, day=1*86400, h=3600, hr=3600, hour=3600,
+		m=60, min=60, minute=60, s=1, sec=1, second=1, ms=1e-3, us=1e-6 )):
+	'Parse [[HH:]MM:]SS or e.g. 5h30m and such time-deltas to seconds'
+	if td is None: return
+	if isinstance(td, (int, float)): return td
+	delta, td_re = 0, ('(?i)^[-+]?' + ''.join(
+		fr'(?P<{k}>\d+{k}{"s?" if len(k)>2 else ""}\s*)?' for k, v in
+		sorted(_tds.items(), key=lambda kv: (-kv[1], -len(kv[0]))) ) + '$')
+	if not ((m := re.search(td_re, td.strip())) and any(m.groups())):
+		h, m, s = (v.strip(': ') for v in ('::' + td).rsplit(':', 2))
+		try: return float(s or 0) + float(m or 0) * 60 + float(h or 0) * 3600
+		except: raise ValueError(f'Unrecognized timespan value format: {td!r}')
+	for k, v in _tds.items():
+		if not m.group(k): continue
+		delta += v * int(''.join(filter(str.isdigit, m.group(k))) or 1)
+	return delta
+
 def retries_within_timeout( tries, timeout,
-		backoff_func=lambda e,n: ((e**n-1)/e), slack=1e-2 ):
-	'Return list of delays to make exactly n tires within timeout, with backoff_func.'
-	a, b = 0, timeout
+		backoff_func=lambda e,n: ((e**n-1)/e), slack=0.01 ):
+	'Return list of delays to make exactly n retries within timeout'
+	a, b = 1, timeout
 	while True:
 		m = (a + b) / 2
 		delays = list(backoff_func(m, n) for n in range(tries))
-		error = sum(delays) - timeout
-		if abs(error) < slack: return delays
+		if abs(error := sum(delays) - timeout) < slack: return delays
 		elif error > 0: b = m
 		else: a = m
 
-def parse_pos_spec(pos):
-	if not pos: return
-	try: mins, secs = pos.rsplit(':', 1)
-	except ValueError: hrs, mins, secs = 0, 0, pos
-	else:
-		try: hrs, mins = mins.rsplit(':', 1)
-		except ValueError: hrs = 0
+def token_bucket_rate(spec, negative_tokens=False):
+	'''Token-bucket rate-limit iterator. Spec: { rate: float | float/td }[:burst_float]
+		Examples: 2.5:5 (rate=2.5/s burst=5), 3/5m:10 (rate=3-in-5m burst=10), 5, 9:30.
+		Yields None if there's enough tokens or delay (float). iter.send(N) to use N tokens.
+		Borrows below zero tokens with negative_tokens set.
+		Simple "inf" value means "always None", or "0" for "infinite delays".'''
 	try:
-		return sum( a*b for a, b in
-			zip([3600, 60, 1], map(float, [hrs, mins, secs])) )
-	except ValueError as err:
-		raise argparse.ArgumentTypeError(
-			f'Failed to parse {pos!r} as [[hours:]minutes:]seconds value: {err}' )
+		if len(s := spec.rsplit(':', 1)) == 1: rate, burst = spec, 1.0
+		else: rate, burst = s[0], float(s[1])
+		if len(s := rate.split('/', 1)) == 1: rate = float(rate)
+		else: rate = float(s[0]) / td_parse(s[1])
+	except: raise ValueError(f'Invalid format for rate-limit: {spec!r}')
+	if rate == float('inf'):
+		while True: yield None
+	elif rate <= 0:
+		while True: yield 2**31 # safe "infinite delay" value
+	n, ts, d = max(0, burst - 1), time.monotonic(), (yield) or 1
+	while True:
+		n = min(burst, n - rate * (ts - (ts := time.monotonic())))
+		if n >= d: n, d = n - d, (yield) or 1; continue
+		n, d = (n - d if negative_tokens else n), (yield (d - n) / rate) or 1
 
 async def maybe_coro(res):
 	if asyncio.iscoroutine(res): res = await res
 	return res
 
+class adict(dict):
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.__dict__ = self
+
 
 class TVFError(Exception): pass
-class TVFWSClosed(TVFError): pass
+class TVFFail(TVFError): pass # fatal errors to console
 class TVFReqError(TVFError): pass
 class TVFReqSocketError(TVFReqError): pass
-
-
-async def vod_fetch(conf, vod_queue, list_formats_only=False):
-	exit_code, exit_sig, log = 1, None, get_logger('tvf.fetcher')
-	loop, task = asyncio.get_running_loop(), asyncio.current_task()
-	def sig_handler(sig, code):
-		log.info('Exiting on {} signal with code: {}', sig, code)
-		nonlocal exit_code, exit_sig
-		exit_code, exit_sig = code, sig
-		task.cancel()
-	if not conf.compat_windows:
-		for sig, code in ('INT', 1), ('TERM', 0):
-			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), ft.partial(sig_handler, sig, code))
-	async with TVF(conf, log) as fetcher:
-		fetch = fetcher.get if not list_formats_only else fetcher.ytdl_probe_formats
-		for n, (url, prefix) in enumerate(vod_queue, 1):
-			info_suffix = None if len(vod_queue) == 1 else f' [{n} / {len(vod_queue)}]'
-			try: await fetch(url, prefix, info_suffix=info_suffix)
-			except asyncio.CancelledError as err: break
-			except TVFError as err:
-				if exit_sig and isinstance(err, TVFReqSocketError):
-					# aria2c can be killed during requests and such, causing socket errors
-					log.debug('Expected connection error on signal-exit: {}', err_fmt(err))
-				else:
-					if err.args: log.exception('BUG: {}', err)
-					log.error('Failed to fetch VoD #{} {!r} (url={!r}), exiting', n, prefix, url)
-				break
-		else: exit_code = 0
-	return exit_code
-
-
-class TVFFileCache:
-
-	update_lock = True
-
-	def __init__(self, prefix, ext, text=True):
-		self.b, self.path = '' if text else 'b', f'{prefix}.{ext}'
-
-	def __enter__(self):
-		assert self.update_lock
-		self.update_lock = False
-		return self
-
-	def __exit__(self, *err):
-		self.update_lock = True
-
-	@property
-	def cached(self):
-		if not os.path.exists(self.path): return None
-		with open(self.path, 'r' + self.b) as src: return src.read()
-
-	def update(self, data):
-		assert not self.update_lock
-		with open(self.path, 'w' + self.b) as dst: dst.write(data)
-		return data
+class TVFWSClosed(TVFReqSocketError): pass
 
 
 class TVFAria2Proc:
@@ -211,16 +149,16 @@ class TVFAria2Proc:
 		self.ws_closed = asyncio.Event()
 		self.cmd_conf, self.ws_key, self.ws_url, self.path_func = (
 			cmd_conf, f'token:{key}', f'ws://localhost:{port}/jsonrpc', path_func )
-		self.log = get_logger('tvf.aria2')
+		self.log = logging.getLogger('tvf.aria2')
 
 	async def __aenter__(self):
 		cmd = [self.conf.aria2_cmd, '--conf-path', self.cmd_conf]
-		self.log.debug('Starting aria2c daemon: {}', ' '.join(cmd))
+		self.log.debug('Starting aria2c daemon: %s', ' '.join(cmd))
 		self.proc = await asyncio.create_subprocess_exec(*cmd)
 		self.ws_ctx = cl.AsyncExitStack()
 		return self
 
-	async def __aexit__(self, *err):
+	async def __aexit__(self, err_t, *err):
 		proc_term_delay = 0
 		if self.ws_ctx:
 			if not self.ws_closed.is_set():
@@ -237,16 +175,18 @@ class TVFAria2Proc:
 			try:
 				self.proc.send_signal(0)
 				self.log.debug( 'Sending SIGTERM to aria2c pid'
-					' (timeout={:.2f}s): {}', self.conf.aria2_term_wait[1], self.proc.pid )
+					' (timeout=%.2f): %s', self.conf.aria2_term_wait[1], self.proc.pid )
 				self.proc.terminate()
 				try: await asyncio.wait_for(self.proc.wait(), timeout=self.conf.aria2_term_wait[1])
 				except asyncio.TimeoutError:
-					self.log.debug('Sending SIGKILL to aria2c pid: {}', self.proc.pid)
+					self.log.debug('Sending SIGKILL to aria2c pid: %s', self.proc.pid)
 					self.proc.kill()
 			except OSError: pass
 			exit_code = await self.proc.wait()
-			if exit_code: self.log.warning('aria2c has exited with error code: {}', exit_code)
+			if exit_code: self.log.warning('aria2c has exited with error code: %s', exit_code)
 			self.proc = None
+		# Actual error should be logged before _ws_close() call
+		return self.ws_closed.is_set() and isinstance(err_t, TVFReqSocketError)
 
 	async def connect(self):
 		loop = asyncio.get_running_loop()
@@ -256,11 +196,11 @@ class TVFAria2Proc:
 			ts = loop.time()
 			if ts >= ts_max: break
 			timeout = ts_max - ts
-			self.log.debug('Connecting to aria2c ws url (timeout={:.2f}s): {}', timeout, self.ws_url)
+			self.log.debug('Connecting to aria2c ws url (timeout=%.2fs): %s', timeout, self.ws_url)
 			try:
 				self.ws = await self.ws_ctx.enter_async_context(self.http.ws_connect(
 					self.ws_url, heartbeat=self.conf.aria2_ws_heartbeat, timeout=timeout ))
-			except aiohttp.ClientError as err: self.log.debug('aria2c conn attempt error: {}', err)
+			except aiohttp.ClientError as err: self.log.debug('aria2c conn attempt error: %s', err)
 			else:
 				self.log.debug('Connected to aria2c json-rpc ws')
 				break
@@ -273,7 +213,7 @@ class TVFAria2Proc:
 				except StopIteration: break
 		if not self.ws:
 			self.ws_closed.set()
-			raise TVFError( 'aria2c connection failed'
+			raise TVFFail( 'aria2c connection failed'
 				' (max_tries={}, timeout={})'.format(*self.conf.aria2_startup_checks) )
 		jrpc_uid_ns = secrets.token_urlsafe(3)
 		self.ws_jrpc_uid_iter = (f'{jrpc_uid_ns}.{n}' for n in range(1, 2**30))
@@ -292,33 +232,34 @@ class TVFAria2Proc:
 		try: yield
 		except asyncio.CancelledError:
 			if not triggered: raise
-			raise TVFWSClosed() from None
+			raise TVFWSClosed from None
 		finally: ev_wait_task.cancel()
 
 	async def _ws_poller(self):
 		try:
 			async for msg in self.ws:
 				if msg.type == aiohttp.WSMsgType.TEXT:
-					if self.conf.aria2_ws_debug: self.log.debug('rpc-msg: {}', msg.data)
+					if self.conf.aria2_ws_debug: self.log.debug('rpc-msg: %s', msg.data)
 					msg_data, hs_discard = json.loads(msg.data), set()
 					if self.conf.aria2_ws_debug_signals and msg_data.get('method'):
-						self.log.debug('rpc-signal: {}', msg.data)
+						self.log.debug('rpc-signal: %s', msg.data)
 					for k, func in self.ws_handlers.items():
 						oneshot = await maybe_coro(func(msg_data))
 						if oneshot: hs_discard.add(k)
 					for k in hs_discard: del self.ws_handlers[k]
 				elif msg.type == aiohttp.WSMsgType.closed: break
 				elif msg.type == aiohttp.WSMsgType.error:
-					self.log.error('ws protocol error, aborting: {}', msg)
+					self.log.error('ws protocol error, aborting: %s', msg)
 					break
-				else: self.log.warning('Unhandled ws msg type {}, ignoring: {}', msg.type, msg)
+				else: self.log.warning('Unhandled ws msg type %s, ignoring: %s', msg.type, msg)
+		except TVFFail as err: self.log.error(str(err)) # expected abort conditions
 		except Exception as err:
-			self.log.exception('Unhandled ws handler failure, aborting: {}', err)
+			self.log.exception('Unhandled ws handler failure, aborting: %s', err)
 		await self._ws_close()
 
 	async def _ws_close(self):
-		await self.ws.close()
 		self.ws_closed.set()
+		await self.ws.close()
 
 	def _add_handler(self, func): self.ws_handlers[id(func)] = func
 
@@ -335,7 +276,7 @@ class TVFAria2Proc:
 				# # How it looks: dict( id=None, jsonrpc='2.0',
 				# #  error=dict(code=-32600, message='Invalid Request.') )
 				# self.log.error( 'Fatal protocol error from aria2'
-				# 	' - probably a bug in this scipt, exiting: {!r}', msg )
+				# 	' - probably a bug in this scipt, exiting: %r', msg )
 				# return await self._ws_close()
 			if uid.startswith('aria2.'): uid = uid[6:]
 			if uid != uid_or_func: return
@@ -350,6 +291,7 @@ class TVFAria2Proc:
 		return fut_or_cb
 
 	async def req(self, method, *params, sync=True):
+		if self.ws_closed.is_set(): raise TVFWSClosed
 		if method != 'system.multicall':
 			method, params = f'aria2.{method}', [self.ws_key] + list(params)
 		res = req_uid = next(self.ws_jrpc_uid_iter)
@@ -357,7 +299,7 @@ class TVFAria2Proc:
 			jsonrpc='2.0', id=req_uid,
 			method=method, params=params )
 		if self.conf.aria2_ws_debug:
-			self.log.debug( 'rpc-req{} [{}]: {}',
+			self.log.debug( 'rpc-req%s [%s]: %s',
 				'-sync' if sync else '', req_uid, json.dumps(data_req) )
 		try: await self.ws.send_str(json.dumps(data_req))
 		except ConnectionError as err:
@@ -365,7 +307,7 @@ class TVFAria2Proc:
 		if sync:
 			with self.ws_close_wrap(): res = await self.expect(req_uid)
 			if self.conf.aria2_ws_debug:
-				self.log.debug('rpc-res-sync [{}]: {}', req_uid, json.dumps(res))
+				self.log.debug('rpc-res-sync [%s]: %s', req_uid, json.dumps(res))
 			if 'result' not in res:
 				raise TVFReqError(f'Request failed (method={method}, params={params}): {res}')
 			res = res['result']
@@ -373,7 +315,7 @@ class TVFAria2Proc:
 
 	async def req_ok(self, method, *params):
 		res = await self.req(method, *params)
-		if res != 'OK': raise TVFError(f'aria2c command failed: {method}{params}')
+		if res != 'OK': raise TVFFail(f'aria2c command failed: {method}{params}')
 
 	def _queue_params(self, gid, url, pos=None):
 		return (
@@ -383,8 +325,8 @@ class TVFAria2Proc:
 	async def queue(self, gid, url, pos=None):
 		res = await self.req('addUri', *self._queue_params(gid, url, pos))
 		if res != gid:
-			self.log.error('addUri error (gid={}): {}', gid, res)
-			raise TVFError(f'Failed to queue chunk URL to aria2c')
+			self.log.error('addUri error (gid=%s): %s', gid, res)
+			raise TVFFail('Failed to queue chunk URL to aria2c')
 
 	async def queue_batch(self, *gid_urls, pos=None):
 		if pos is not None: pos = iter(range(pos, 2**30))
@@ -396,16 +338,16 @@ class TVFAria2Proc:
 		if res != res_chk:
 			log_lines(self.log.error, [
 				'Result gid match check failed for submitted urls.',
-				('  expected: {}', ', '.join(str(r[0]) for r in res_chk)),
-				('  returned: {}', ', '.join(( str(r[0])
+				('  expected: %s', ', '.join(str(r[0]) for r in res_chk)),
+				('  returned: %s', ', '.join(( str(r[0])
 					if isinstance(r, list) else repr(r) ) for r in res)) ])
-			raise TVFError(f'Failed to queue {len(gid_urls)} chunk URLs to aria2c')
+			raise TVFFail(f'Failed to queue {len(gid_urls)} chunk URLs to aria2c')
 
 	async def queue_chunks(self, chunks):
 		self.chunks = chunks
 		count, gid_last = 0, None
 		with self.ws_close_wrap():
-			for gid_url_batch in it_adjacent_nofill(chunks, self.conf.aria2_queue_batch):
+			for gid_url_batch in it.batched(chunks, self.conf.aria2_queue_batch):
 				await self.queue_batch(*gid_url_batch)
 				count, gid_last = count + len(gid_url_batch), gid_url_batch[-1][0]
 		return count, gid_last
@@ -456,7 +398,7 @@ class TVFChunkIter:
 
 	def mark_needed(self, gid, check=True):
 		if check and gid not in self.gids_done:
-			raise TVFError(f'BUG: gid was not marked as done: {gid}')
+			raise TVFFail(f'BUG: gid was not marked as done: {gid}')
 		self.gids_done.discard(gid)
 
 	def mark_done(self, gid):
@@ -467,62 +409,65 @@ class TVFChunkIter:
 		return len(self.gid_urls) == len(self.gids_done)
 
 
-@add_stack_wrappers
 class TVF:
 
 	def __init__(self, conf, log):
-		self.conf, self.log = conf, log or get_logget('tvf.fetcher')
+		self.conf, self.log = conf, log or logging.getLogger('tvf.fetcher')
 
 	async def __aenter__(self): return self
 	async def __aexit__(self, *err): pass
 
 	async def ytdl_run(self, ytdl_op, *args, check=True, out=False, **popen_kws):
-		cmd = ['youtube-dl']
+		cmd = [self.conf.ytdl_cmd]
 		if self.conf.verbose: cmd.append('--verbose')
 		cmd = cmd + [ytdl_op] + (self.conf.ytdl_opts or list()) + list(args)
-		self.log.debug('Running "youtube-dl {}" command: {}', ytdl_op, ' '.join(cmd))
+		self.log.debug('Running "youtube-dl %s" command: %s', ytdl_op, ' '.join(cmd))
 		if out: popen_kws.setdefault('stdout', asyncio.subprocess.PIPE)
 		proc = await asyncio.create_subprocess_exec(*cmd, **popen_kws)
 		if out: proc_stdout = (await proc.stdout.read()).strip()
 		exit_code = await proc.wait()
 		if check and exit_code != 0:
-			raise TVFError(f'"youtube-dl {ytdl_op}" command exited with error (code={exit_code})')
+			raise TVFFail(f'"youtube-dl {ytdl_op}" command exited with error (code={exit_code})')
 		return exit_code if not out else proc_stdout.decode()
 
 	async def ytdl_probe_formats(self, url, file_prefix, info_suffix=None):
 		self.log.info( '--- Listing formats available'
-			' for VoD {} (url={}){}', file_prefix, url, info_suffix or '' )
+			' for VoD %s [url %s ]%s', file_prefix, url, info_suffix or '' )
 		return await self.ytdl_run('--list-formats', url, check=False)
 
-
-	async def get(self, ctx: cl.AsyncExitStack, url, file_prefix, info_suffix=None):
+	async def download(self, url, file_prefix, info_suffix=None):
+		async with cl.AsyncExitStack() as ctx:
+			return await self._download(ctx, url, file_prefix, info_suffix)
+	async def _download(self, ctx, url, file_prefix, info_suffix=None):
 		if file_prefix.lower().endswith('.mp4'): file_prefix = file_prefix[:-4]
 		file_prefix = pl.Path(file_prefix)
-		file_prefix_ext = lambda ext: file_prefix.parent / (file_prefix.name + f'.{ext}')
-
-		file_dst_path = file_prefix_ext('mp4')
-		file_dst_done = file_dst_path
-
+		file_prefix_ext = lambda ext: pl.Path(f'{file_prefix}.{ext}')
+		file_dst_done = file_dst_path = file_prefix_ext('mp4')
 		if self.conf.use_temp_dirs:
 			name = file_prefix.name
 			file_prefix_dir = file_prefix.parent / (name + '.tmp')
 			file_prefix = file_prefix_dir / name
 
-		vod_cache = ft.partial(TVFFileCache, file_prefix)
+		def _cache_file(name):
+			p = file_prefix_ext(name)
+			return adict( path=str(p),
+				cached=lambda: p.exists() and p.read_text(),
+				update=lambda data: [p.write_text(data), data][1] )
+
+		meta_cf = _cache_file('info.json')
+		meta = json.loads(meta_cf.cached() or 'null')
 
 		if self.conf.ytdl_output_format:
-			ytdl_fn_vc = ctx.enter_context(vod_cache('ytdl_filename'))
-			ytdl_filename = ytdl_fn_vc.cached
-			if not ytdl_filename:
-				ytdl_output_opts = list() \
-					if self.conf.ytdl_output_format is True \
-					else ['--output', self.conf.ytdl_output_format]
-				ytdl_filename = await self.ytdl_run('--get-filename', *ytdl_output_opts, url, out=True)
+			if not meta:
+				ytdl_fn = ( [] if self.conf.ytdl_output_format is True
+					else ['--output', self.conf.ytdl_output_format] )
+				meta = json.loads(await self.ytdl_run('-sj', *ytdl_fn, url, out=True))
+			ytdl_fn = meta['filename']
 			self.log.debug(
-				'Using youtube-dl output filename (template={}): {}',
+				'Using youtube-dl output filename [template %s ]: %s',
 				'[default]' if self.conf.ytdl_output_format
-					is True else self.conf.ytdl_output_format, ytdl_filename )
-			file_dst_done = file_dst_path.parent / ytdl_filename
+					is True else self.conf.ytdl_output_format, ytdl_fn )
+			file_dst_done = file_dst_path.parent / ytdl_fn
 		elif self.conf.file_part_suffix:
 			file_dst_done = file_dst_path
 			file_dst_path = file_dst_path.parent / (file_dst_path.name[:-4] + '.part.mp4')
@@ -531,60 +476,58 @@ class TVF:
 		# It's not a problem even with --keep-tempfiles, as file_dst_mark will be kept there too
 		if file_dst_done.exists() and (
 				file_dst_path != file_dst_done or not file_prefix_ext('m3u8').exists() ):
-			self.log.info( '--- Skipping download'
-				' for existing file: {} (rename/remove it to force)', file_dst_done )
-			return
+			return self.log.info( '--- Skipping download'
+				' for existing file: %s (rename/remove it to force)', file_dst_done )
 
 		if self.conf.use_temp_dirs: file_prefix_dir.mkdir(exist_ok=True)
-		if self.conf.ytdl_output_format and not ytdl_fn_vc.cached: ytdl_fn_vc.update(ytdl_filename)
+		if not meta: meta = json.loads(await self.ytdl_run('-sj', url, out=True))
+		if not meta_cf.cached(): meta_cf.update(json.dumps(meta))
 		http = await ctx.enter_async_context(aiohttp.ClientSession(**self.conf.aiohttp_opts))
 
-		self.log.info( '--- Downloading VoD {} ({}url={}){}',
-			file_dst_path, f'final-name={str(file_dst_done)!r}, '
+		self.log.info( '--- Downloading VoD %s %s[url %s ]%s',
+			file_dst_path, f'[final-name {file_dst_done} ] '
 				if file_dst_done != file_dst_path else '', url, info_suffix or '' )
 
-		with vod_cache('m3u8.url') as vc:
-			url_pls = vc.cached or vc.update(await self.ytdl_run('--get-url', url, out=True))
+		url_pls, headers = meta['url'], meta['http_headers']
 		assert ' ' not in url_pls, url_pls # can return URLs of multiple flvs for *really* old VoDs
 		url_base = url_pls.rsplit('/', 1)[0]
 
-		with vod_cache('m3u8.ua') as vc:
-			ua = vc.cached or vc.update(await self.ytdl_run('--dump-user-agent', out=True))
-
-		with vod_cache('m3u8') as vc:
-			pls = vc.cached
-			if not pls:
-				self.log.debug('Fetching playlist from URL: {}', url_pls)
-				async with http.get(url_pls, headers={'User-Agent': ua}) as res:
-					pls = vc.update(await res.text())
+		if not (pls := (cf := _cache_file('m3u8')).cached()):
+			url, proxy = '', aiohttp.helpers.proxies_from_env() # not for aria2c ws
+			if proxy := proxy.get('https') or proxy.get('http') or dict():
+				if not re.match('https?://', url := str(proxy.proxy)): url = f'http://{url}'
+				url, proxy = f' [proxy: {url} ]', dict(proxy=url, proxy_auth=proxy.proxy_auth)
+			self.log.debug('Fetching playlist from URL%s: %s', url, url_pls)
+			async with http.get(url_pls, headers=headers, **proxy) as res:
+				pls = cf.update(await res.text())
 
 		# Config is always updated between aria2c runs, to account for any cli opts changes
-		with vod_cache('aria2c_conf') as vc:
-			key = secrets.token_urlsafe(18)
-			with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-				s.bind(('localhost', 0))
-				addr, port = s.getsockname()
-			vc.update(self.conf.aria2_conf_func(adict(
-				key=key, port=port, ua=ua,
-				log_level='notice' if self.conf.verbose else 'warn' )))
-			aria2c_conf_path = vc.path
+		key = secrets.token_urlsafe(18)
+		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+			s.bind(('localhost', 0)); addr, port = s.getsockname()
+		try: ua = next(hdr for k, hdr in headers.items() if k.lower() == 'user-agent')
+		except StopIteration: ua = self.log.warning(
+			'Missing User-Agent header in ytdl info for URL, will use aria2c default' )
+		(cf := _cache_file('aria2c_conf')).update(self.conf.aria2_conf_func(adict(
+			key=key, port=port, ua=ua, log_level='notice' if self.conf.verbose else 'warn' )))
+		aria2c_conf_path = cf.path
 
 		# file_dst_mark stores (pos, seq) tuples, appending each update to the end
 		# It is assumed here that such tiny writes will be atomic
 		file_dst_pos = file_dst_seq = 0 # position in dst file, sequential gid int
 
-		file_dst_mark_fmt = '>QI'
+		file_dst_mark_fmt = struct.Struct('>QI')
 		file_dst_mark = ctx.enter_context(file_prefix_ext('pos').open('a+b'))
 		if file_dst_mark.tell() != 0:
-			file_dst_mark.seek(-struct.calcsize(file_dst_mark_fmt), os.SEEK_END)
-			file_dst_pos, file_dst_seq = struct.unpack(file_dst_mark_fmt, file_dst_mark.read())
+			file_dst_mark.seek(-file_dst_mark_fmt.size, os.SEEK_END)
+			file_dst_pos, file_dst_seq = file_dst_mark_fmt.unpack(file_dst_mark.read())
 
 		if not file_dst_path.exists() and file_dst_pos > 0:
-			raise TVFError( f'Missing partial-dst-file'
+			raise TVFFail( f'Missing partial-dst-file'
 				f' (expecting bytes={file_dst_pos:,} gid-seq={file_dst_seq}): {file_dst_path}' )
 		file_dst = file_dst_path.open('a+b')
 		if file_dst.tell() < file_dst_pos:
-			raise TVFError( f'Missing chunk of partial-dst-file'
+			raise TVFFail( f'Missing chunk of partial-dst-file'
 				f' (expecting size>={file_dst_pos:,} actual-size={file_dst.tell():,}): {file_dst_path}' )
 		file_dst.seek(file_dst_pos)
 		file_dst.truncate()
@@ -604,18 +547,6 @@ class TVF:
 		async with TVFAria2Proc(
 				self.conf, http, aria2c_conf_path, key, port,
 				lambda gid: file_prefix_ext(f'{gid}.mp4.chunk') ) as aria2c:
-			await aria2c.connect()
-
-			# All chunks from iter(chunks) get queued for download here
-			info = await aria2c.req('getVersion')
-			self.log.debug( 'Starting downloads'
-				' (rpc-port={}, aria2-version={})...', port, info['version'] )
-			count, gid_last = await aria2c.queue_chunks(chunks)
-			if gid_last:
-				self.log.info( '\n\n  ------ Started {} downloads,'
-					' last gid: {} ------  \n', count, gid_pretty(gid_last) )
-			else: self.log.info('No extra downloads were necessary')
-
 			### Main download-control loop ahead
 			# Download control strategy:
 			# - listen for aria2.onDownloadComplete event for each gid
@@ -623,13 +554,29 @@ class TVF:
 			#   - non-sequential gids - just remember and check/append next time
 			#   - if >file_append_max non-sequential-gid chunks downloaded - abort
 			# - for all error/paused/stopped events: prepend to download queue
+			#   - aria2.onDownloadError also has separate err_rate_limit handler/check
 			# - stop on chunks.finished (all chunks marked as "done")
+			await aria2c.connect()
+			aria2c_info = await aria2c.req('getVersion')
 
 			ev_t = enum.Enum('ev_type', 'complete stop pause error')
 			evq, ev_tuple = asyncio.Queue(), cs.namedtuple('ev', 't data')
-			for t in ev_t:
-				aria2c.expect( f'onDownload{t.name.title()}',
-					lambda e,t=t: evq.put_nowait(ev_tuple(t, e)) )
+			if tbf_errs := self.conf.aria2_err_tbf:
+				def _err_rate_limit(ev):
+					nonlocal tbf_errs_total; tbf_errs_total += 1
+					if next(tbf_errs): raise TVFFail( 'Number of aria2 download errors went'
+						f' over --aria2c-err-tbf rate-limit ({tbf_errs_total:,d} errors in total)' )
+				tbf_errs_total = 0; aria2c.expect('onDownloadError', _err_rate_limit)
+			for t in ev_t: aria2c.expect(
+				f'onDownload{t.name.title()}', lambda e,t=t: evq.put_nowait(ev_tuple(t, e)) )
+
+			# All chunks from iter(chunks) get queued for download here
+			self.log.debug( 'Starting downloads'
+				' (rpc-port=%s, aria2-version=%s)...', port, aria2c_info['version'] )
+			count, gid_last = await aria2c.queue_chunks(chunks)
+			if gid_last: self.log.info( '\n\n  ------ Started %s'
+				' downloads, last gid: %s ------  \n', count, gid_pretty(gid_last) )
+			else: self.log.info('No extra downloads were necessary')
 
 			while not chunks.finished:
 
@@ -639,19 +586,18 @@ class TVF:
 						if ev.t == ev_t.complete: # completed chunk goes to seq_heap
 							files = list(map(op.itemgetter('path'), await aria2c.req('getFiles', e['gid'])))
 							if len(files) != 1:
-								raise TVFError( 'Completed aria2 download'
+								raise TVFFail( 'Completed aria2 download'
 									f' should produce single chunk-file, instead has: {files}' )
 							heapq.heappush( seq_heap,
 								seq_chunk(gid_to_seq(e['gid']), pl.Path(files[0])) )
 							await aria2c.req('removeDownloadResult', e['gid'], sync=False)
 							chunks.mark_done(e['gid'])
 						else: # stop/pause/error - retry immediately
-							# Limit on forced retries (on top of what aria2 does) for same gid can be added here
 							if self.log.isEnabledFor(logging.DEBUG):
 								status = await aria2c.req( 'tellStatus', e['gid'],
 									['status', 'errorCode', 'errorMessage', 'completedLength', 'totalLength'] )
-								self.log.debug( 'Chunk {} download'
-									' stopped or failed, retrying: {}', e['gid'], status )
+								self.log.debug( 'Chunk %s download'
+									' stopped or failed, retrying: %s', e['gid'], status )
 							await aria2c.req_ok('removeDownloadResult', e['gid'])
 							await aria2c.queue(e['gid'], chunks.gid_urls[e['gid']], 0)
 
@@ -665,19 +611,19 @@ class TVF:
 							with p.open('rb') as chunk: shutil.copyfileobj(chunk, file_dst)
 							file_dst_pos = file_dst.tell()
 						file_dst.flush()
-						file_dst_mark.write(struct.pack(file_dst_mark_fmt, file_dst_pos, file_dst_seq))
+						file_dst_mark.write(file_dst_mark_fmt.pack(file_dst_pos, file_dst_seq))
 						file_dst_mark.flush()
 						for p in seq_chunks: os.unlink(p)
-						# self.log.debug('\nExtended partial dst file by {} chunk(s)', len(seq_chunks))
+						# self.log.debug('\nExtended partial dst file by %s chunk(s)', len(seq_chunks))
 						seq_chunks.clear()
 
 				if len(seq_heap) > self.conf.file_append_max:
 					err_msg = ( 'Chunk-append sequence is broken'
 						f' (pending={len(seq_heap)} max={self.conf.file_append_max})' )
-					log_lines(self.log.error, [ ('{}:', err_msg),
-						('  expecting gid: {}', seq_to_gid(file_dst_seq)),
-						('  first gid among pending: {}', seq_to_gid(seq_heap[0].seq)) ])
-					raise TVFError(err_msg)
+					log_lines(self.log.error, [ ('%s:', err_msg),
+						('  expecting gid: %s', seq_to_gid(file_dst_seq)),
+						('  first gid among pending: %s', seq_to_gid(seq_heap[0].seq)) ])
+					raise TVFFail(err_msg)
 
 		### done!
 
@@ -690,119 +636,184 @@ class TVF:
 			file_dst_path = file_dst_done
 
 		if not self.conf.keep_tempfiles:
-			self.log.debug('Cleanup for prefix (dir={}): {}', self.conf.use_temp_dirs, file_prefix)
+			self.log.debug( 'Cleanup for prefix'
+				' [dir %s ]: %s', self.conf.use_temp_dirs, file_prefix )
 			if self.conf.use_temp_dirs: shutil.rmtree(file_prefix_dir)
 			else:
 				for p in file_prefix.parent.glob(f'{file_prefix.name}.*'):
 					if p != file_dst_path: os.unlink(p)
 
-		self.log.info('--- Downloaded VoD file: {}{}', file_dst_path, info_suffix or '')
+		self.log.info('--- Downloaded VoD file: %s%s', file_dst_path, info_suffix or '')
 
+
+async def vod_fetch_loop(conf, vod_queue, list_formats_only=False):
+	'Async wrapper to run TVF.download(url) for each URL, handling errors in there'
+	exit_code, exit_sig, log = 1, None, logging.getLogger('tvf.fetcher')
+	loop, task = asyncio.get_running_loop(), asyncio.current_task()
+	def sig_handler(sig, code):
+		log.info('Exiting on %s signal with code: %s', sig, code)
+		nonlocal exit_code, exit_sig
+		exit_code, exit_sig = code, sig
+		task.cancel()
+	if not conf.compat_windows:
+		for sig, code in ('INT', 1), ('TERM', 0):
+			loop.add_signal_handler(getattr(signal, f'SIG{sig}'), ft.partial(sig_handler, sig, code))
+	async with TVF(conf, log) as fetcher:
+		fetch = fetcher.download if not list_formats_only else fetcher.ytdl_probe_formats
+		for n, (url, prefix) in enumerate(vod_queue, 1):
+			info_suffix = None if len(vod_queue) == 1 else f' [{n} / {len(vod_queue)}]'
+			try: await fetch(url, prefix, info_suffix=info_suffix)
+			except asyncio.CancelledError as err: break
+			except TVFError as err:
+				if exit_sig and isinstance(err, TVFReqSocketError):
+					# aria2c can be killed during requests and such, causing socket errors
+					log.debug('Expected connection error on signal-exit: %s', err_fmt(err))
+				else:
+					if err.args: log.exception('BUG: %s', err)
+					log.error('Failed to fetch VoD #%s %r (url=%r), exiting', n, prefix, url)
+				break
+		else: exit_code = 0
+	return exit_code
 
 def main(args=None, conf=None):
 	if not conf: conf = TVFConfig()
 
-	import argparse
+	import argparse, textwrap
+	dd = lambda text: re.sub( r' \t+', ' ',
+		textwrap.dedent(text).strip('\n') + '\n' ).replace('\t', '  ')
 	parser = argparse.ArgumentParser(
+		formatter_class=argparse.RawTextHelpFormatter,
 		usage='%(prog)s [options] { url-1 [url-2 ...] | url file_prefix [url-2 file_prefix-2 ...] }',
 		description='Download VoD (or a specified slice of it) from twitch.tv.')
-	parser.add_argument('url', nargs='?',
-		help='URL for a VoD to fetch.'
-			' Can be either followed by file_prefix argument'
-				' (and any number of such url/prefix pairs after that),'
-				' or any number of urls (detected by "http(s):" prefix)'
-				' to use simple sequential prefixes like "vod-001".'
-			' See also -o/--ytdl-output-format option wrt destination filenames for urls.')
-	parser.add_argument('file_prefix', nargs='?',
-		help='File prefix for destination file and temp dir.'
-			' Used even with -o/--ytdl-output-format while download is in progress.')
+	parser.add_argument('url', nargs='?', help=dd('''
+		URL for a twitch.tv stream recording (aka VoD) to fetch.
+		Can be either followed by file_prefix argument
+			(and any number of such url/prefix pairs after that),
+			or any number of urls (detected by "https:" prefix)
+			to use simple sequential prefixes like "vod-001" for them.
+		See also -o/--ytdl-output-format option wrt destination filenames for urls.'''))
+	parser.add_argument('file_prefix', nargs='?', help=dd('''
+		File prefix for destination file and temp dir.
+		Still used with -o/--ytdl-output-format while download is in progress.'''))
 	parser.add_argument('more_url_and_prefix_pairs', nargs='*',
 		help='Any number of extra urls or url/file_prefix pairs can be specified.')
 
-	group = parser.add_argument_group('Download slice options')
+	group = parser.add_argument_group('Download slice options',
+		description='If multiple url/prefix args are specified,'
+			' all these will be applied same to each one of them.')
 	group.add_argument('-s', '--start-pos',
-		type=parse_pos_spec, metavar='[[hours:]minutes:]seconds',
-		help='Only download video chunks after specified start position.'
-			' If multiple url/prefix args are specified, this option will be applied to all of them.')
+		type=td_parse, metavar='time', help=dd('''
+			Only download video chunks after specified start position.
+			Time can be formatted as "[[hours:]minutes:]seconds" or e.g. "XhYmZs",
+				with any h/m/s component being optional, and they all added together.
+			Examples: 120 (seconds), 17m, 2:55:30, 20m40s, 30:00, 1h16m, 3h11m49s.'''))
 	group.add_argument('-l', '--length',
-		type=parse_pos_spec, metavar='[[hours:]minutes:]seconds',
-		help='Only download specified length of the video (from specified start or beginning).'
-			' If multiple url/prefix args are specified, this option will be applied to all of them.')
+		type=td_parse, metavar='time', help=dd('''
+			Only download specified length of the video (from specified start or beginning).
+			Same time string format as in -s/--start-pos option.'''))
+	group.add_argument('-e', '--end-pos',
+		type=td_parse, metavar='time', help=dd('''
+			Only download video up to a specified timestamp,
+				would be same as -l/--length option if used without -s/--start-pos.
+			Same time string format as in -s/--start-pos option.'''))
 	group.add_argument('-x', '--scatter',
-		metavar='[[hours:]minutes:]seconds/[[hours:]minutes:]seconds',
-		help='Out of whole video (or a chunk specified by --start and --length),'
-				' download only every N seconds (or mins/hours) out of M.'
-			' E.g. "1:00/10:00" spec here will download 1 first min of video out of every 10.'
-			' Idea here is to produce something like preview of the video to allow'
-				' to easily narrow down which part of it is interesting and worth downloading in full.')
+		metavar='[[hh:]mm:]ss/[[hh:]mm:]ss', help=dd('''
+			Out of whole video (or a chunk specified by --start and --length),
+				download only every N seconds (or mins/hours) out of M.
+			Same format(s) for time strings as in -s/--start-pos option are allowed.
+			E.g. "1m/10m" spec here will download 1 first min of video out of every 10.
+			Idea here is to produce something like preview of the video to allow
+				to easily narrow down which part of it is interesting and worth downloading in full.'''))
 
-	group = parser.add_argument_group('youtube-dl/aria2c options')
-	group.add_argument('-F', '--ytdl-list-formats',
-		action='store_true', help='Do not download anything,'
-			' just list formats available for each specified URL and exit.')
-	group.add_argument('-y', '--ytdl-opts',
-		action='append', metavar='opts',
-		help='Extra opts for youtube-dl --get-url/--get-filename commands.'
-			' Will be split on spaces, unless option is used multiple times.')
+	group = parser.add_argument_group('youtube-dl/aria2c options', description=(
+		'https_proxy= env variable is also supported, but not socks_proxy= (aria2c limitation).' ))
+	group.add_argument('-c', '--ytdl-cmd', metavar='command', help=dd('''
+		youtube-dl/yt-dlp command or path.
+		Default is to use whichever one of youtube-dl/yt-dlp is available in PATH.'''))
+	group.add_argument('-F', '--ytdl-list-formats', action='store_true', help=dd('''
+		Do not download anything,
+			just list formats available for each specified URL and exit.'''))
+	group.add_argument('-y', '--ytdl-opts', action='append', metavar='opts', help=dd('''
+		Extra opts for youtube-dl metadata-fetching command.
+		Will be split on spaces, unless option is used multiple times.'''))
 	group.add_argument('-o', '--ytdl-output-format',
-		metavar='ytdl-output-template', const=True, nargs='?',
-		help='Use youtube-dl output filename template.'
-			' Passed to youtube-dl --get-filename as the'
-				' --output argument to get the final file name for the video.'
-			' If option is used, but no format is specified, youtube-dl\'s default format will be used.')
-	group.add_argument('-a', '--aria2c-opts',
-		action='append', metavar='opts',
-		help='Extra options to store in aria2c configuration file.'
-			' These are same as long-form command-line options, but without double-dash prefix.'
-			' Will be split on spaces, unless option is used multiple times.'
-			' Example: --aria2c-opts "lowest-speed-limit=20K max-overall-download-limit=1M"')
-	group.add_argument('--aria2c-opts-print', action='store_true',
-		help='Print template for aria2c configuration file'
-			' that will be used, with all options there. Short form: -ap')
+		metavar='ytdl-output-template', const=True, nargs='?', help=dd('''
+			Use specified youtube-dl output filename template for a final downloaded file.
+			Passed to youtube-dl --dump-json as the --output
+				argument to get the final file name for the video.
+			Prefix-name argument is still used while download is in-progress, only renamed at the end.
+			If option is used, but no format is specified, youtube-dl's default format will be used.'''))
+	group.add_argument('-a', '--aria2c-opts', action='append', metavar='opts', help=dd('''
+		Extra options to store in aria2c configuration file.
+		These are same as long-form command-line options, but without double-dash prefix.
+		Will be split on spaces, unless option is used multiple times.
+		Example: --aria2c-opts "lowest-speed-limit=20K max-overall-download-limit=1M"'''))
+	group.add_argument('--aria2c-opts-print', action='store_true', help=dd('''
+		Print template for aria2c configuration file
+			that will be used, with all options there. Short form: -ap'''))
+	group.add_argument('--aria2c-err-tbf', default='2/1m:30',
+		metavar='{ rate | N / timespan }[:burst]', help=dd('''
+			Token-bucket rate-limit on aria2c errors, to abort if exceeded.
+			General format is "errors_per_second [:burst_errors]" where burst defaults to 1,
+				and errors_per_second can be "N / timespan" (timespan same as in -s/--start-pos).
+			For example "2.5:20" means "<2.5 errors per second, with burst/buffer of 20",
+				to tolerate up to 20 immediate errors, replenishing that limit at 2.5 errs/second,
+				or "3/5m:10" can be used to say "up to 3 errors in 5m, with burst=10".
+			"inf" value disables the limit, "0" aborts on first error. Default: %(default)s'''))
 
 	group = parser.add_argument_group('Misc/debug options')
 	group.add_argument('-p', '--use-part-suffix',
 		action='store_true', help='Use .part suffix for'
 			' partial destination file until it is fully downloaded.')
-	group.add_argument('-n', '--no-temp-dirs',
-		action='store_true', help='Do not create temporary'
-			' directories for download parts, keep everything in the destination one.')
-	group.add_argument('-k', '--keep-tempfiles',
-		action='store_true', help='Do not remove all the'
-				' temporary files after successfully assembling resulting mp4.'
-			' Chunks in particular might be useful to download different but overlapping video slices.')
+	group.add_argument('-n', '--no-temp-dirs', action='store_true', help=dd('''
+		Do not create temporary directories for
+			download parts, keep everything in the destination one.'''))
+	group.add_argument('-k', '--keep-tempfiles', action='store_true', help=dd('''
+		Do not remove all the temporary files after successfully assembling resulting mp4.
+		Chunks in particular might be useful to download different but overlapping video slices.'''))
 	group.add_argument('--debug', action='store_true', help='Verbose operation mode.')
 
 	opts = parser.parse_args(sys.argv[1:] if args is None else args)
 
 	logging.basicConfig(
 		datefmt='%Y-%m-%d %H:%M:%S',
-		format='%(asctime)s :: {}%(levelname)s :: %(message)s'\
+		format='%(asctime)s :: {}%(levelname)s :: %(message)s'
 			.format('%(name)s ' if opts.debug else ''),
 		level=logging.DEBUG if opts.debug else logging.INFO )
 	logging.getLogger('charset_normalizer').setLevel(logging.WARNING) # noisy aiohttp dep
-	log = get_logger('tvf.main')
+	log = logging.getLogger('tvf.main')
 
+	if opts.length and opts.end_pos:
+		parser.error('Only one of -l/--length or -e/--end-pos can be specified, not both')
 	conf.slice_start, conf.slice_len = opts.start_pos or 0, opts.length
+	if opts.end_pos:
+		conf.slice_len = opts.end_pos - conf.slice_start
+		if conf.slice_len <= 0: parser.error('-e/--end-pos time must be after -s/--start-pos')
 	if opts.scatter:
 		scatter = opts.scatter.split('/', 1)
-		if len(scatter) != 2:
-			parser.error( f'Invalid value for -x/--scatter option'
-				' - {opts.scatter!r} - should be in "len/interval" format.' )
-		conf.slice_scatter_len, conf.slice_scatter_interval = map(parse_pos_spec, scatter)
+		if len(scatter) != 2: parser.error( 'Invalid value for -x/--scatter'
+			f' option - {opts.scatter!r} - should be in "len/interval" format.' )
+		conf.slice_scatter_len, conf.slice_scatter_interval = map(td_parse, scatter)
+	if opts.aria2c_err_tbf: conf.aria2_err_tbf = token_bucket_rate(opts.aria2c_err_tbf)
 
 	conf.ytdl_opts = opts.ytdl_opts or list()
 	if len(conf.ytdl_opts) == 1: conf.ytdl_opts = conf.ytdl_opts[0].strip().split()
 	conf.aria2c_opts = opts.aria2c_opts or list()
 	if len(conf.aria2c_opts) == 1: conf.aria2c_opts = conf.aria2c_opts[0].strip().split()
-
 	if conf.aria2c_opts == ['p']: opts.aria2c_opts_print, conf.aria2c_opts = True, list()
 	if opts.aria2c_opts_print:
-		print(conf.aria2_conf_func(adict(
+		return print(conf.aria2_conf_func(adict(
 			key='<key>', port='<port>', ua='<ytdl-user-agent>',
 			log_level='notice' if conf.verbose else 'warn' )).strip())
-		return
 	if not opts.url: parser.error('At least one video URL must be specified.')
+	if not (ytdl_cmd := opts.ytdl_cmd):
+		import subprocess as spr
+		for ytdl_cmd in 'yt-dlp', 'youtube-dl':
+			try: spr.run( [ytdl_cmd, '--help'], check=True,
+				stdout=spr.DEVNULL, stderr=spr.DEVNULL ); break
+			except (FileNotFoundError, spr.CalledProcessError): pass
+		else: parser.error('Failed to find working youtube-dl/yt-dlp in current PATH')
+	conf.ytdl_cmd = ytdl_cmd
 
 	conf.verbose = opts.debug
 	conf.keep_tempfiles = opts.keep_tempfiles
@@ -819,14 +830,14 @@ def main(args=None, conf=None):
 		if len(args) % 2:
 			parser.error( 'Odd number of url/prefix args specified'
 				f' ({len(args)}), while these should always come in pairs.' )
-		for url, prefix in it_adjacent(args, 2):
+		for url, prefix in it.batched(args, 2):
 			if url_re.search(prefix):
 				if url_re.search(url):
 					parser.error( 'Both url/file_prefix args seem'
 						f' to be an URL, only first one should be: {url} {prefix}' )
 				prefix, url = url, prefix
 				log.warn( 'Looks like url/prefix args got'
-					' mixed-up, correcting that to prefix={} url={}', prefix, url )
+					' mixed-up, correcting that to [prefix %s ] [url %s ]', prefix, url )
 			vod_queue.append((url, prefix))
 	for url, prefix in vod_queue:
 		if re.search(r'^https?://[^/]+/([^/]+/v|videos)/', url): continue
@@ -839,7 +850,7 @@ def main(args=None, conf=None):
 		asyncio.set_event_loop(loop)
 
 	log.debug('Starting vod_fetch loop...')
-	exit_code = asyncio.run(vod_fetch(
+	exit_code = asyncio.run(vod_fetch_loop(
 		conf, vod_queue, list_formats_only=opts.ytdl_list_formats ))
 	log.debug('Finished')
 	return exit_code

@@ -180,14 +180,13 @@ def main(args=None):
 			sshd_config snippet to set this script for backup-user command:
 
 				Match User backup
-					# GatewayPorts yes
-					PasswordAuthentication no
 					X11Forwarding no
 					AllowAgentForwarding no
-					PermitTTY no
 					PermitTunnel no
 					AllowStreamLocalForwarding no
 					AllowTcpForwarding remote
+					PasswordAuthentication no
+					PermitTTY no
 					ForceCommand ~/ssh-r-sync-recv -- /mnt/backups
 
 			Any cli opts of this script should be added to ForceCommand (string for shell).
@@ -303,7 +302,7 @@ def main(args=None):
 	rsync_opts = ['--delete', '--delete-excluded', '--zl=1']
 	if rsync_info.opts.get('one_file_system'): rsync_opts.append('-x')
 	if su_mode: rsync_opts.extend(['-HaAXS', '--super', '--numeric-ids'])
-	else: rsync_opts.append('-rltHE')
+	else: rsync_opts.append('-rltHES')
 	if su_fake: rsync_opts.append('--fake-super')
 
 	hook = bak_hooks.run( 'rsync.pre',

@@ -159,9 +159,10 @@ def systemd_state_dump_parse(state_map_str, prefix_fmt='{name}/', **parse_kws):
 	for name, state_str in state_map_str.items():
 		try: machine_state = ssd_parse_machine(state_str, **parse_kws)
 		except Exception as err:
+			machine = f'machine {name!r}' if name != '_host' else 'host'
 			print(
 				f'ERROR: Failed to parse state-dump ({len(state_str):,d} B)'
-				f' for machine {name!r}]: [{err.__class__.__name__}] {err}', file=sys.stderr )
+				f' for {machine}: [{err.__class__.__name__}] {err}', file=sys.stderr )
 			raise
 		prefix = prefix_fmt.format(name=name)
 		for unit, props in machine_state.items():
@@ -173,7 +174,7 @@ def systemd_state_dump_parse(state_map_str, prefix_fmt='{name}/', **parse_kws):
 def ssd_parse_machine(state_str, filter_prop=None, filter_unit=None):
 	state_lines = iter(state_str.splitlines())
 	state_lines = it.dropwhile(lambda line: re.search(
-		r'^(Manager:|Features:|Timestamp) ', line ), state_lines)
+		r'^(Manager:|Features:|Subscribed:|Timestamp) ', line ), state_lines)
 	if not filter_prop: filter_prop = lambda k: True
 	if not filter_unit: filter_unit = lambda u: True
 
@@ -186,7 +187,7 @@ def ssd_parse_machine(state_str, filter_prop=None, filter_unit=None):
 		if prop_sub is not None:
 			k, indent, v = prop_sub
 			m = (
-				re.search(r'^{}\s+(.*)(?::\s*|=)(.*)$'.format(re.escape(indent)), line)
+				re.fullmatch(r'{}\s+(.*)(?::\s*|=)(.*)'.format(re.escape(indent)), line)
 				if filter_prop(k) else None )
 			if m:
 				sk, sv = m.groups()
@@ -198,15 +199,15 @@ def ssd_parse_machine(state_str, filter_prop=None, filter_unit=None):
 				prop_sub = None
 
 		if props is not None:
-			m = re.search(r'^(\s+)-> (Exec\w+):$', line)
+			m = re.fullmatch(r'(\s+)(->|→) (Exec\w+):', line)
 			if m:
-				prop_sub = m.group(2), m.group(1), dict()
+				prop_sub = m.group(3), m.group(1), dict()
 				continue
-			m = re.search(r'^(\s+)-> Job (\d+):$', line)
+			m = re.fullmatch(r'(\s+)(->|→) Job (\d+):', line)
 			if m:
 				prop_sub = None, m.group(1), dict() # discarded later
 				continue
-			m = re.search(r'^\s+(.*?)(?::\s*|=)(.*)$', line)
+			m = re.fullmatch(r'\s+(.*?)(?::\s*|=)(.*)', line)
 			if m:
 				k, v = m.groups()
 				if filter_prop(k): props.setdefault(k, list()).append(v)
@@ -220,13 +221,13 @@ def ssd_parse_machine(state_str, filter_prop=None, filter_unit=None):
 			props = None
 
 		if props is None:
-			m = re.search(r'^-> Job (\d+):$', line)
+			m = re.fullmatch(r'(->|→) Job (\d+):', line)
 			if m: unit, props = None, dict() # discarded later
 
 		if props is None:
-			m = re.search(r'^-> Unit (.*):$', line)
+			m = re.fullmatch(r'(->|→) Unit (.*):', line)
 			if not m: raise ValueError(repr(line))
-			unit, props = m.group(1), dict()
+			unit, props = m.group(2), dict()
 			unit = re.sub( br'\\x([\da-f]{2})',
 				lambda m: chr(int(m.group(1), 16)).encode(),
 				unit.encode() ).decode()
@@ -254,11 +255,11 @@ def main(args=None):
 	if not opts.unit:
 		# These are purely for performance optimization purposes.
 		# On hosts with containers, dumps can get pretty large and slow to parse.
-		filter_prop_keys = { 'Type', 'Source Path',
+		filter_prop_keys = { 'Type', 'Source Path', 'StandardInput',
 			'Transient', 'Unit Load State', 'Unit Active State', 'TriggeredBy' }
 		filters = dict(
 			filter_prop=lambda k,_set=filter_prop_keys: k in _set,
-			filter_unit=lambda u: not re.search(r'\.(device|slice|scope)$', u) )
+			filter_unit=lambda u: not re.search(r'\.(device|slice|scope)\Z', u) )
 	else: filters = dict()
 	out_filter = opts.exclude_regexp and re.compile(opts.exclude_regexp)
 
@@ -277,23 +278,24 @@ def main(args=None):
 		return
 
 	for unit, s in sorted(state.items()):
-		if re.search(r'\.(device|slice|scope)$', unit): continue
+		if re.search(r'\.(device|slice|scope)\Z', unit): continue
 
 		# Raw dm-* numbers change, so no point tracking these
-		if re.search(r'(/|^)dev-dm-\d+\.swap$', unit): continue
+		if re.search(r'(/|^)dev-dm-\d+\.swap\Z', unit): continue
 
 		# Skip any known auto-started/stopped and transient units
 		# Does not skip: Unit=X from timers/sockets
 		# WARNING: be sure to add all props used there to filter_prop_keys above!
 		if unit.endswith('.mount') and f'{unit[:-6]}.automount' in state: continue
-		if unit.endswith('.service') and (
-			f'{unit[:-8]}.timer' in state or f'{unit[:-8]}.socket' in state ): continue
+		if unit.endswith('.service') and ( s.standard_input_N == 'socket'
+			or f'{unit[:-8]}.timer' in state or f'{unit[:-8]}.socket' in state ): continue
 		if s.type_N == 'dbus': continue
 		if s.source_path_N == '/proc/self/mountinfo': continue
 		if s.transient_N == 'yes': continue
-		if re.search(r'(/|^)user(-runtime-dir)?@\d+\.service$', unit): continue
-		if ( re.search(r'(/|^)[^/@]+@[^/]+\.service$', unit)
+		if re.search(r'(/|^)user(-runtime-dir)?@\d+\.service\Z', unit): continue
+		if ( re.search(r'(/|^)[^/@]+@[^/]+\.service\Z', unit)
 			and s.triggered_by_N.endswith('.socket') ): continue
+		if re.search(r'(/|^)dev-disk-by-(diskseq-\d+|uuid-[-\w]+)\.swap\Z', unit): continue
 
 		if s.unit_load_state in ['error', 'not-found']: continue
 		if s.unit_active_state != 'active': continue

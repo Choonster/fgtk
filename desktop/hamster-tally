@@ -2,7 +2,7 @@
 
 import itertools as it, operator as op, functools as ft
 import pathlib as pl, datetime as dt, subprocess as sp, collections as cs
-import os, sys, re, logging, math
+import os, sys, re, logging, math, csv
 
 
 class LogMessage:
@@ -26,8 +26,8 @@ class adict(dict):
 		self.__dict__ = self
 
 
-_td_days = dict( y=365.25, yr=365.25,
-	year=365.25, mo=30.5, month=30.5, w=7, week=7, d=1, day=1 )
+_td_days = dict( y=365.2422, yr=365.2422,
+	year=365.2422, mo=30.5, month=30.5, w=7, week=7, d=1, day=1 )
 _td_s = dict( h=3600, hr=3600, hour=3600,
 	m=60, min=60, minute=60, s=1, sec=1, second=1 )
 def _td_re():
@@ -36,7 +36,7 @@ def _td_re():
 	ts_re = ['^'] + [
 		r'(?P<{0}>\d*{0}s?\s*)?'.format(k)
 		for k, v in it.chain.from_iterable(
-			map(sub_sort, [_td_days, _td_s]) ) ] + ['$']
+			map(sub_sort, [_td_days, _td_s]) ) ] + ['\\Z']
 	return re.compile(''.join(ts_re), re.I | re.U)
 _td_re = _td_re()
 
@@ -66,9 +66,9 @@ def td_parse(td_str, to_float=True):
 
 def td_repr( ts, ts0=None, units_max=2, units_res=None,
 		_units=dict( h=3600, m=60, s=1,
-			y=365.25*86400, mo=30.5*86400, w=7*86400, d=1*86400 ) ):
+			y=365.2422*86400, mo=30.5*86400, w=7*86400, d=1*86400 ) ):
 	delta = ts if ts0 is None else (ts - ts0)
-	if isinstance(delta, dt.timedelta): delta = ts.total_seconds()
+	if isinstance(delta, dt.timedelta): delta = delta.total_seconds()
 	res, s, n_last = list(), abs(delta), units_max - 1
 	units = sorted(_units.items(), key=lambda v: v[1], reverse=True)
 	for unit, unit_s in units:
@@ -111,7 +111,7 @@ def log_fn_fmt_re(log_fmt):
 	log_fmt_vars.update( year=r'\d{4}', mo=r'\d{2}',
 		mo_name=r'\d\d_\w+', dd1=r'-?\d\d', dd2=r'\d\d' )
 	if not all(log_fmt_vars.values()): raise AssertionError(log_fmt_vars)
-	return re.compile(f'^{log_fmt.format(**log_fmt_vars)}$')
+	return re.compile(f'^{log_fmt.format(**log_fmt_vars)}\\Z')
 
 def log_total_td(lines): return sum(map(op.attrgetter('td'), lines))
 def log_total_line(lines):
@@ -265,10 +265,11 @@ def main(args=None):
 		(dt2 + dt.timedelta(days=1)).strftime('%Y-%m-%d %H:%M') )
 	log.debug('Hamster tsv-query: {} - {}', ts1, ts2)
 	res = sp.run(['hamster', 'export', 'tsv', ts1, ts2], check=True, stdout=sp.PIPE)
-	tsv = res.stdout.decode().splitlines()
+	tsv = list(csv.reader(res.stdout.decode().splitlines(), 'excel-tab'))
 	# Expected fields: activity, start, end, duration, category, description, tags
-	tsv_line = cs.namedtuple('EvTSV', list(k.split(' ', 1)[0] for k in tsv[0].split('\t')))
-	tsv = list(tsv_line(*map(str.strip, line.split('\t'))) for line in tsv[1:] if line.strip())
+	tsv_line = cs.namedtuple('EvTSV', list(k.split(' ', 1)[0] for k in tsv[0]))
+	tsv = list( tsv_line(*line) for line in
+		(list(s.strip() for s in line) for line in tsv[1:]) if any(line) )
 	log.debug('Processed hamster tsv events: {}', len(tsv))
 
 	# Convert TSV entries to new log-events
@@ -277,7 +278,7 @@ def main(args=None):
 		if not tev.end: continue # activity-span is not running right now, log later when done
 		ts1, ts2 = map(dt.datetime.fromisoformat, [tev.start, tev.end])
 		if ts2 <= dt1: continue # in case export returns old events
-		desc = tev.activity
+		desc = tev.activity.replace(';', ',') # hamster >3.02 treats commas specially #753
 		if tev.description.strip(): desc += f' - {tev.description}'
 		evs, desc = None, desc.replace('\n', ' // ')
 		if ts1.date() != ts2.date(): # starts/ends on different days, split if ts2>dt2

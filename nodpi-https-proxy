@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+import os, sys, socket, logging, inspect, random, signal, enum, asyncio
+
+
+err_fmt = lambda err: f'[{err.__class__.__name__}] {err}'
+
+def parse_ep(ep, port_def, host_def=None):
+	host, _, port = ep.rpartition(':')
+	if host and port and port.isdigit(): port = int(port)
+	elif host_def and ep.isdigit(): host, port = host_def, int(ep)
+	else: host, port = ep, port_def
+	if host[0] == '[' and host[-1] == ']': host = host[1:-1] # raw ipv6
+	return host, port
+
+class HTTPSFragProxy:
+
+	buff_sz = 1500
+	split_types = enum.Enum('SplitType', 'random sni')
+
+	def __init__( self, sni_list=None,
+			idle_timeout=None, block_http=False, split_type=None, **bind ):
+		self.idle_timeout, self.block_http = idle_timeout, block_http
+		self.split_type, self.bind = split_type or self.split_types.random, bind
+		if sni_list is not None:
+			if not sni_list: sni_list = [b'\0'] # match nothing
+			else: sni_list = list(s.strip().encode() for s in sni_list)
+		self.snis, self.log = sni_list, logging.getLogger('nhp.proxy')
+
+	async def run(self):
+		loop, self.activity = asyncio.get_running_loop(), asyncio.Event()
+		for sig in signal.SIGINT, signal.SIGTERM:
+			# Hard-exit to not deal with asyncio.start_server crap and not close systemd-fd
+			# See https://github.com/python/cpython/issues/113538 and all links there
+			loop.add_signal_handler(sig, lambda: os._exit(0))
+		if self.idle_timeout: asyncio.create_task(self.idle_stop(self.idle_timeout))
+		server = await asyncio.start_server(self.conn_handle, **self.bind)
+		await server.serve_forever()
+
+	async def idle_stop(self, timeout):
+		while True:
+			try: await asyncio.wait_for(self.activity.wait(), timeout)
+			except TimeoutError:
+				self.log.debug('Exiting on timeout (%.1fs)', timeout)
+				return os.kill(os.getpid(), signal.SIGTERM)
+			self.activity.clear()
+
+	async def conn_wrap(self, func, cid, reader, writer, close_writer=True):
+		try: await func(cid, reader, writer)
+		except Exception as err: # handles client closing connection too
+			writer.close()
+			self.log.info('Connection error [%s]: %s', ':'.join(cid), err_fmt(err))
+		finally:
+			if close_writer: writer.close()
+
+	def conn_handle(self, reader, writer):
+		cid = list(map(str, writer.get_extra_info('peername')))
+		return self.conn_wrap(self._conn_handle, cid, reader, writer)
+
+	async def _conn_handle(self, cid, reader, writer):
+		self.activity.set()
+		http_data = await reader.read(self.buff_sz)
+		if not http_data: writer.close(); return
+		method, url = dst = http_data.split(b'\r\n')[0].decode().split()[:2]
+		self.log.debug( 'Connection [%s] ::'
+			' %s %s [buff=%d]', ':'.join(cid), method, url, len(http_data) )
+		cid.extend(dst)
+
+		if https := (method == 'CONNECT'): port_def = 443
+		elif not url.startswith('http://') or self.block_http: raise ValueError(url)
+		else: url, port_def = url[7:].split('/', 1)[0], 80
+		host, port = parse_ep(url, port_def)
+
+		try: xreader, xwriter = await asyncio.open_connection(host, port)
+		except OSError as err: return self.log.info( 'Connection [%s] to %s:%s'
+			' failed (tls=%s): %s', ':'.join(cid), host, port, int(https), err_fmt(err) )
+		self.activity.set()
+		if not https: xwriter.write(http_data); await xwriter.drain()
+		else:
+			writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+			await writer.drain()
+			await self.conn_wrap(self.fragment_data, cid, reader, xwriter, False)
+
+		for task in asyncio.as_completed([
+				self.conn_wrap(self.pipe, cid, reader, xwriter),
+				self.conn_wrap(self.pipe, cid, xreader, writer) ]):
+			await task
+
+	async def fragment_data(self, cid, reader, writer):
+		head = await reader.read(5)
+		splits, parts, data = list(), list(), await reader.read(2048)
+		if self.snis and all(site not in data for site in self.snis):
+			writer.write(head); writer.write(data); await writer.drain(); return
+
+		if (t := self.split_type) is t.sni:
+			for n in range(len(data) - 16):
+				if not ( data[n] == data[n+1] == data[n+2] ==
+					data[n+4] == data[n+6] == data[n+7] == 0 ): continue
+				ext_len, sn_list_len, sn_len = data[n+3], data[n+5], data[n+8]
+				if not (ext_len - sn_list_len == 2 and sn_list_len - sn_len == 3): continue
+				splits.extend([n0 := n + 9, n0 + (sn_len + 1) // 2, n0 + sn_len + 1]); break
+
+		if not splits: # "random" default/fallback
+			n, n_max = 0, (nd := len(data)) - 10
+			if (host_end := data.find(b'\x00')) != -1: splits.append(n := host_end + 1)
+			while n <= n_max: splits.append(n := random.randint(n, nd))
+
+		n0 = 0; splits.append(len(data))
+		self.log.debug(' [%s] frag ends: %s', ':'.join(cid), splits)
+		for n in splits:
+			if n == n0: continue
+			parts.append(b'\x16\x03\x04' + (n - n0).to_bytes(2, 'big') + data[n0:n])
+			n0 = n
+		writer.write(b''.join(parts)); await writer.drain()
+
+	async def pipe(self, cid, reader, writer):
+		while not reader.at_eof() and not writer.is_closing():
+			self.activity.set()
+			data = await reader.read(self.buff_sz); writer.write(data); await writer.drain()
+
+
+def main(args=None):
+	host_def, port_def = '127.0.0.1', 8101
+
+	import argparse, textwrap, re
+	dd = lambda text: re.sub( r' \t+', ' ',
+		textwrap.dedent(text).strip('\n') + '\n' ).replace('\t', '  ')
+	parser = argparse.ArgumentParser(usage='%(prog)s [options]',
+		formatter_class=argparse.RawTextHelpFormatter, description=dd('''
+			HTTP-proxy for TLS connections that detects specific hosts in SNI fields
+				and fragments those to avoid/confuse deep packet inspection (DPI) systems.
+			Despite the name, it should be set as "HTTP Proxy" in e.g. browsers, NOT HTTPS one.
+			Based on https://github.com/GVCoder09/NoDPI distributed under GPL v3 license.'''))
+	parser.add_argument('-i', '--bind',
+		metavar='host[:port]', default=f'{host_def}:{port_def}', help=dd('''
+			Address/host and/or port for proxy to listen on (defaults: %(default)s).
+			It should be used and accessible with e.g. http_proxy= env-var.
+			Ignored if process is started by systemd from a socket unit.'''))
+	parser.add_argument('-d', '--frag-domains', metavar='file', help=dd('''
+		File with a list of space/newline-separated domains
+			to detect in TLS handshakes and fragment connection data for.
+		"-" can be used for stdin, or %%-prefixed number for any file descriptor (e.g. %%3).
+		Default is to apply such fragmentation to all processed connections.'''))
+	parser.add_argument('-f', '--frag-type', metavar='type', choices=['random', 'sni'], help=dd('''
+		Where to fragment packets:
+			random (default) - pick offset at random somewhere within Client Hello TLS record.
+			sni - around and in the middle of first SNI name, found by zero-bytes in it.
+		"random" is used as a fallback if e.g. finding sni doesn't work.'''))
+	parser.add_argument('-t', '--idle-timeout', type=float, metavar='seconds', help=dd('''
+		Stop after number of seconds being idle. Useful if started from systemd socket.'''))
+	parser.add_argument('--block-http', action='store_true', help=dd('''
+		Reject/close insecure plaintext http connections made through the proxy.'''))
+	parser.add_argument('--debug', action='store_true', help='Verbose logging to stderr.')
+	opts = parser.parse_args(sys.argv[1:] if args is None else args)
+
+	logging.basicConfig( format='%(levelname)s :: %(message)s',
+		level=logging.WARNING if not opts.debug else logging.DEBUG )
+	log = logging.getLogger('nhp.main')
+
+	sni_list = None
+	if p := opts.frag_domains:
+		if not p or p == '-': src = sys.stdin
+		else: src = open(p if p[0] != '%' else int(p[1:]))
+		sni_list = src.read().split()
+
+	sd_pid, sd_fds = (int(os.environ.get(f'LISTEN_{k}', 0)) for k in ['PID', 'FDS'])
+	if sd := (sd_pid == os.getpid() and sd_fds):
+		if sd_fds > 1: return log.error( 'More than one socket passed'
+			'  from systemd, exiting (pid=%s fds=%s)', sd_pid, sd_fds ) or 1
+		log.debug('Listening on socket fd=3 received from systemd')
+		proxy = dict(sock=socket.socket(fileno=3))
+	else:
+		host, port = parse_ep(opts.bind, host_def=host_def, port_def=port_def)
+		proxy = dict(host=host, port=port)
+	proxy = HTTPSFragProxy( sni_list=sni_list,
+		split_type=(st := HTTPSFragProxy.split_types[opts.frag_type or 'random']),
+		idle_timeout=opts.idle_timeout, block_http=opts.block_http, **proxy )
+
+	log.debug( 'Starting proxy on %s (%s)...', 'systemd-fd' if sd else f'{host} {port}',
+		(f'{len(sni_list):,d} SNI domains' if sni_list is not None else 'fragmenting any SNI')
+		+ f', method={st.name}' )
+	return asyncio.run(proxy.run())
+
+if __name__ == '__main__': sys.exit(main())

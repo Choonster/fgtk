@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 
-import itertools as it, functools as ft, operator as op
-import pathlib as pl, datetime as dt, urllib.parse as up, hashlib as hl, subprocess as sp
-import xml.etree.ElementTree as etree
-import os, sys, re, logging, time, calendar, base64, json, textwrap, unicodedata
+import itertools as it, operator as op, hashlib as hl, subprocess as sp
+import pathlib as pl, datetime as dt, urllib.request as ur, urllib.parse as up
+import xml.etree.ElementTree as etree, base64, json, textwrap, unicodedata
+import os, sys, re, socket, logging, time, math, calendar
 
 import feedparser as fp # pip install --user feedparser
-import http.client # feedparser fetches can raise errors from here
+import http.client as hc, urllib.error as ue # feedparser fetches can raise those errors
 
 
 class LogMessage:
@@ -25,8 +25,51 @@ err_fmt = lambda err: '[{}] {}'.format(err.__class__.__name__, err)
 get_logger = lambda name: LogStyleAdapter(logging.getLogger(f'ytf2e.{name}'))
 
 
-str_norm = lambda v: unicodedata.normalize('NFKC', v.strip()).casefold()
+_td_days = dict(
+	y=365.2422, yr=365.2422, year=365.2422,
+	mo=30.5, month=30.5, w=7, week=7, d=1, day=1 )
+_td_s = dict( h=3600, hr=3600, hour=3600,
+	m=60, min=60, minute=60, s=1, sec=1, second=1 )
+_td_usort = lambda d: sorted(
+	d.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True )
+_td_re = re.compile('(?i)^[-+]?' + ''.join( fr'(?P<{k}>\d+{k}\s*)?'
+	for k, v in [*_td_usort(_td_days), *_td_usort(_td_s)] ) + '\\Z')
 
+def td_parse(td_str):
+	try: return float(td_str)
+	except: td = 0
+	if (m := _td_re.search(td_str)) and any(m.groups()):
+		# Short time offset like "3d 5h"
+		for n, units in enumerate((_td_days, _td_s)):
+			tdx = 0
+			for k, v in units.items():
+				if not m.group(k): continue
+				tdx += v * int(''.join(filter(str.isdigit, m.group(k))) or 1)
+			td += (24*3600)**(1-n) * tdx
+		return td
+	if m := re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2}(?P<us>\.\d+)?)?', td_str):
+		# [[HH:]MM:]SS where seconds can be fractional
+		return sum(n*float(m) for n,m in zip((3600, 60, 1), td_str.split(':')))
+	raise ValueError(f'Failed to parse time-delta spec: {td_str}')
+
+def td_repr(delta, units_max=2, units_res=None, _units=dict(
+		h=3600, m=60, s=1, y=365.2422*86400, mo=30.5*86400, w=7*86400, d=1*86400 )):
+	res, s, n_last = list(), abs(delta), units_max - 1
+	units = sorted(_units.items(), key=lambda v: v[1], reverse=True)
+	for unit, unit_s in units:
+		val = math.floor(s / unit_s)
+		if not val:
+			if units_res == unit: break
+			continue
+		if len(res) == n_last or units_res == unit:
+			val, n_last = round(s / unit_s), True
+		res.append(f'{val:.0f}{unit}')
+		if n_last is True: break
+		s -= val * unit_s
+	return ' '.join(res) if res else '<1s'
+
+
+str_norm = lambda v: unicodedata.normalize('NFKC', v.strip()).casefold()
 str_hash = lambda p: base64.urlsafe_b64encode(
 	hl.blake2s(str(p).encode(), person=b'ytf2e.s1').digest() ).decode()[:12]
 
@@ -62,11 +105,30 @@ dd = lambda text: (textwrap.dedent(text).strip('\n') + '\n').replace('\t', '  ')
 fill = lambda s,w=90,ind='',ind_next='  ',**k: textwrap.fill(
 	s, w, initial_indent=ind, subsequent_indent=ind if ind_next is None else ind_next, **k )
 
+class RX:
+	'''Can be just a python "re" regexp (case-insensitive by default),
+			or one or more /.../-wrapped regexps like <flags>/<regexp>/ [&& ...]
+			with optional flags and " && " AND-logic connectors.
+		<flags> can be empty or any combo of: ! - negation ("not match"),
+			I - case-sensitive, i - case-insensitive (already a default).'''
+	def __init__(self, s):
+		self.rx_list = list()
+		for n, rx in enumerate(s.split(' && ')):
+			if not (m := re.fullmatch(r'([!iI]+)?/(.+)/', rx)):
+				if n: raise ValueError('Chained regexps must be /.../-wrapped')
+				self.rx_list.append((False, re.compile(rx, re.I))); continue
+			self.rx_list.append(( '!' in (m[1] or ''),
+				re.compile(m[2], re.NOFLAG if 'I' not in (m[1] or '') else re.I) ))
+	def __repr__(self): return '<RX[ ' + ' && '.join(
+		(' !'[neg] + ' i'[bool(rx.flags & re.I)]).strip()
+			+ f'/{rx.pattern}/' for neg, rx in self.rx_list ) + ' ]>'
+	def check(self, s): return all(neg ^ bool(rx.search(s)) for neg, rx in self.rx_list)
+
 
 class YTFeed:
 
 	title = chan = url = title_filter = None
-	ts_last_check = 0
+	ts_last_check = ts_err = 0
 	delay_ewma = 24 * 3600
 	delay_ewma_max = 30 * 24 * 3600
 	delay_ewma_a = 0.3
@@ -82,7 +144,7 @@ class YTFeed:
 	def __repr__(self):
 		chan = self.chan
 		if self.title_filter: chan = f'{chan} || {self.title_filter}'
-		f'YTFeed({self.title} [{chan}])'
+		return f'YTFeed({self.title} [{chan}])'
 
 	@classmethod
 	def from_xml(cls, attrs):
@@ -92,9 +154,9 @@ class YTFeed:
 	def from_line(cls, line):
 		title_filter, line = None, line.strip().split(None, 1)
 		url, title = line if len(line) > 1 else (line[0], None)
-		if '||' in title:
-			title, title_filter = map(str.strip, title.split('||', 1))
-			title_filter = re.compile(title_filter)
+		if ' || ' in (title := title.split(' # ', 1)[0]):
+			title, title_filter = map(str.strip, title.split(' || ', 1))
+			title_filter = RX(title_filter)
 		return cls(url, title, title_filter)
 
 	def ts_check_next(self):
@@ -110,7 +172,7 @@ class YTFeed:
 
 	def filter_check(self, title):
 		if not self.title_filter: return True
-		return bool(self.title_filter.search(title))
+		return self.title_filter.check(title)
 
 
 class YTFeedIndex:
@@ -138,12 +200,14 @@ class YTFeedIndex:
 # Line format: {ts} :: {chan-id} {chan-name!r} :: {update-json}
 state_log_name = 'updates.log'
 state_log_max_size = 3 * 2**20
+state_keys_opt = 'etag seen_entries ts_err'.split()
+state_keys = 'chan ts_last_check delay_ewma'.split() + state_keys_opt
 
 def state_process(state_dir, feeds):
 	if not state_dir: return
 	state_dir, log = pl.Path(state_dir), get_logger('state')
 	if not state_dir.exists():
-		state_dir.mkdir(mode=0o700, parents=True, exists_ok=True)
+		state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 	state_last, state_log = dict(), state_dir / state_log_name
 	with state_log.open('a+') as src:
@@ -165,21 +229,28 @@ def state_process(state_dir, feeds):
 		state_log_new = state_log.open('a')
 	try:
 		for line, feed, update in state_last.values():
-			for k in 'ts_last_check etag seen_entries delay_ewma'.split():
+			for k in state_keys:
 				try: setattr(feed, k, update[k])
 				except KeyError:
-					if k != 'seen_entries': raise
+					if k not in state_keys_opt: raise
 			if state_log_new: state_log_new.write(line)
 	finally:
 		if state_log_new: state_log_new.close()
 
 	return state_log
 
-def state_update(state_log, ts, feed, update):
+def state_update(state_log, ts, feed, update=None, **update_keys):
+	# Doesn't copy ts_err unless set explicitly on errors
 	ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(ts))
-	update = json.dumps(update)
-	with state_log.open('a') as dst:
-		dst.write(f'{ts} :: {feed.chan} {feed.title!r} :: {update}\n')
+	update = dict(update or dict( chan=feed.chan,
+		ts_last_check=feed.ts_last_check, delay_ewma=feed.delay_ewma,
+		etag=feed.etag, seen_entries=feed.seen_entries ), **update_keys)
+	for k in (sks := state_keys):
+		if (opt := k in state_keys_opt) and not update.get(k): update.pop(k, None)
+		elif not opt and k not in update: raise ValueError(f'Missing state-key: {k}')
+	if k := ' '.join(set(update).difference(sks)): raise ValueError(f'Extra state-keys: {k}')
+	update = f'{ts} :: {feed.chan} {feed.title!r} :: {json.dumps(update)}\n'
+	with state_log.open('a') as dst: dst.write(update)
 
 
 class FeedFetchError(Exception): pass
@@ -188,27 +259,32 @@ feed_user_agent = f'yt-feed-to-email/0.1 feedparser/{fp.__version__}'
 feed_accept_header = ( 'application/atom+xml,application/rdf+xml,'
 	'application/rss+xml,application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2' )
 
-def feed_fetch(log, url, etag):
-	try:
-		feed = fp.parse( url, agent=feed_user_agent,
-			etag=etag, request_headers=dict(Accept=feed_accept_header) )
-		status, bozo, bozo_err = (
-			feed.get(k) for k in ['status', 'bozo', 'bozo_exception'] )
-	except http.client.HTTPException as err:
-		status, bozo, bozo_err = 0, True, err_fmt(err)
+def feed_fetch(log, url, etag, retries, **fp_parse_kws):
+	for delay in retries + [None]:
+		try:
+			feed = fp.parse( url, agent=feed_user_agent, etag=etag,
+				request_headers=dict(Accept=feed_accept_header), **fp_parse_kws )
+			status, bozo, bozo_err = (
+				feed.get(k) for k in ['status', 'bozo', 'bozo_exception'] )
+		except (hc.HTTPException, ue.URLError, TimeoutError) as err:
+			status, bozo, bozo_err = 0, True, err_fmt(err)
+		if delay is None or status not in [404, 500]: break
+		log.debug('Feed fetch http-404/500 error, retrying after {}s delay...', delay)
+		time.sleep(delay)
 	if (not status and bozo) or (status or 1000) >= 400:
-		raise FeedFetchError(f'feedparser error (status={status}): {url} - {bozo_err}')
+		raise FeedFetchError(f'feedparser error (status={status}) - {bozo_err}')
 	if status == 304: return
 	elif status >= 300: raise FeedFetchError(f'Unhandled 3xx response status {status}')
 	return feed.get('etag'), feed.entries
 
-def feed_process(log, feed, entries, ts, ts_since=None):
+def feed_process(log, feed, entries, ts, ts_since=None, ignore_shorts=False):
 	first_old_id = e_ts_prev = None
 	ewma_delay, ewma_a = feed.delay_ewma, feed.delay_ewma_a
 	emails, feed_ids, seen_ids = list(), dict(), feed.seen_entries or dict()
 
 	for e in entries:
 		if not feed.filter_check(e.title): continue
+		if ignore_shorts and '/shorts/' in e.link: continue
 
 		e_id, e_ts = feed.entry_id(e), calendar.timegm(e.published_parsed)
 		if not e_id: raise ValueError(f'Failed to get id for feed entry: {str_repr(e)}')
@@ -273,33 +349,40 @@ def process_summary(text, w=120, pre='  '):
 
 def main(args=None):
 	import argparse
-	parser = argparse.ArgumentParser(
-		description='Script to generate email notifications for YouTube OPML/RSS feed updates.')
+	parser = argparse.ArgumentParser(usage='%(prog)s [options]',
+		formatter_class=argparse.RawTextHelpFormatter, description=dd('''
+			Script to generate email notifications for YouTube OPML/RSS feed updates.
+			Will use <scheme>_proxy environment variables to pickup proxy servers, if used.'''))
 
 	group = parser.add_argument_group('Feed sources')
 	group.add_argument('-o', '--opml', metavar='file',
 		help='YT OPML export from https://www.youtube.com/subscription_manager?action_takeout=1 link.')
-	group.add_argument('-r', '--rss-list', metavar='file',
-		help='File with YT RSS/Atom feed URLs, one per line, with optional comments after URLs.')
+	group.add_argument('-r', '--rss-list', metavar='file', help=dd('''
+		File with YT RSS/Atom feed URLs, one per line, with optional name/filters/comments after URL.
+		General line syntax is: <URL> [<name>] [ || <rx>] [ # <comment>]
+			Examples: https://www.youtube.com/feeds/... MyChannel Reviews || - Review$
+				https://... OtherChannel news no-summaries || /\\[News\\]/ && !/\\bSummary\\b/
+		Where <rx> can be regexp (case-insensitive by default), or one or more /.../-wrapped
+			regexps like "<flags>/<regexp>/ [&& ...]" with optional flags and " && " AND-connectors.
+			<flags> can be empty or any combo of: ! - negation ("not match"),
+			I - case-sensitive, i - case-insensitive (already a default).'''))
 	group.add_argument('-c', '--opml-convert', action='store_true',
 		help='Append all new feeds from specified -o/--opml file to -r/--rss-list and exit.')
 
 	group = parser.add_argument_group('Notification options')
 	group.add_argument('-e', '--email', metavar='addr', required=True,
 		help='Email address to send video notifications to via local "mail" command.')
-	group.add_argument('-d', '--email-delay',
-		type=float, metavar='float', default=1.1,
-		help='Delay between running notification-command in seconds.'
-			' Useful to make sure emails sort by date/time correctly within same channel,'
-				' and don\'t all have same exact timestamp. Default is %(default)ss (0 - disable).')
+	group.add_argument('-d', '--email-delay', type=float, metavar='seconds', default=1.1, help=dd('''
+		Delay between running notification-command in seconds.
+		Useful to make sure emails sort by date/time correctly within same channel,
+			and don\'t all have same exact timestamp. Default is %(default)ss (0 - disable).'''))
 
 	group = parser.add_argument_group('State storage/init')
 	group.add_argument('-s', '--state-dir', default='state', metavar='path',
 		help='Directory to use for storing per-feed "last check" timestamps. Default: %(default)s')
-	group.add_argument('-t', '--new-feed-time',
-		type=float, metavar='posix-ts',
-		help='Timestamp to fetch entries after for new/unknown feeds.'
-			' Default or 0 is to generate notifications for all entries in new feeds.')
+	group.add_argument('-t', '--new-feed-time', type=float, metavar='posix-ts', help=dd('''
+		Timestamp to fetch entries after for new/unknown feeds.
+		Default or 0 is to generate notifications for all entries in new feeds.'''))
 
 	group = parser.add_argument_group('Check filtering and rate-limiting')
 	group.add_argument('-n', '--feed-name', metavar='name',
@@ -308,6 +391,23 @@ def main(args=None):
 		help='Limit on number of feeds to check in one run. Default or 0 - no limit.')
 	group.add_argument('-f', '--force', action='store_true',
 		help='Force-check feeds regardless of timestamps.')
+	group.add_argument('--no-shorts', action='store_true',
+		help='Filter-out and ignore "shorts" videos intended for phones in the feed.')
+
+	group = parser.add_argument_group('Error handling')
+	group.add_argument('--tempfail-retry-delays',
+		metavar='n', default='60:60:120', help=dd('''
+			Colon-separated list of delays (in seconds) before making extra attempt(s)
+				to fetch specific feed after YT returns http-404 or 500 errors for it.
+			These errors seem to happen quite often at random with YT feeds, and retrying
+				immediately often works. Empty value - no retries. Default: %(default)s'''))
+	group.add_argument('--tempfail-grace-period',
+		metavar='timespan', default='2d', help=dd('''
+			Do not report any consecutive tempfail-type errors (http-404 or 500)
+				unless they've been happening without any successful fetch for a while.
+			Can be a number of seconds, or [[HH:]MM:]SS[.MS],
+				or a short time-delta spec like "30s", "10min", "1h 20m", "1d12h5m"
+			Intended as a workaround for YT feeds' crappiness. 0 - disable. Default: %(default)s'''))
 
 	group = parser.add_argument_group('Debug options')
 	group.add_argument('--debug', action='store_true', help='Verbose operation mode.')
@@ -320,6 +420,9 @@ def main(args=None):
 	log = get_logger('main')
 
 	feeds_rss = feeds_opml = list()
+	fetch_err_td = td_parse(opts.tempfail_grace_period)
+	fetch_retries = ( list() if not (ds := opts.tempfail_retry_delays)
+		else list(max(0, float(d.strip())) for d in ds.split(':')) )
 
 	if opts.opml:
 		def _get_outlines(e, feeds=None):
@@ -337,7 +440,8 @@ def main(args=None):
 		rss_list = pl.Path(opts.rss_list)
 		if rss_list.exists():
 			with rss_list.open() as src:
-				feeds_rss = list(YTFeed.from_line(line) for line in src)
+				feeds_rss = list( YTFeed.from_line(line)
+					for line in src if line.strip() and not line.lstrip().startswith('#') )
 			log.debug('Parsed RSS-list: feeds={}', len(feeds_rss))
 	feeds_rss = YTFeedIndex(feeds_rss)
 
@@ -353,6 +457,9 @@ def main(args=None):
 		print(f'-- added feeds: {n}')
 		return
 
+	fp_kws = dict()
+	if proxies := ur.getproxies(): fp_kws['handlers'] = [ur.ProxyHandler(proxies)]
+	socket.setdefaulttimeout(60)
 	feeds = YTFeedIndex(feeds_opml, feeds_rss)
 	state_log = state_process(opts.state_dir, feeds)
 	log.debug('Feed Index: feeds={} state-log={}', len(feeds_rss), state_log)
@@ -369,10 +476,19 @@ def main(args=None):
 
 		feed_log = get_logger(f'feed.{feed.chan}')
 		feed_log.debug('Fetching feed: {} [ {} ]', feed.title, feed.url)
-		try: etag, entries = feed_fetch(feed_log, feed.url, feed.etag)
+		try: etag, entries = feed_fetch(
+			feed_log, feed.url, feed.etag, fetch_retries, **fp_kws )
 		except FeedFetchError as err:
-			feed_log.error('Failed to fetch feed: {}', err)
-			etag = entries = None
+			etag = entries = td = None
+			if ( not feed.seen_entries or not fetch_err_td
+					or (feed.ts_err and (td := ts - feed.ts_err) > fetch_err_td) ):
+				td = f' for {td_repr(td)} :' if td else ''
+				feed_log.error('Failed to fetch feed [ {} ]{}: {}', feed.title, td, err)
+			elif not feed.ts_err and not opts.dry_run:
+				if not opts.dry_run: state_update(state_log, ts, feed, ts_err=ts)
+			if not isinstance(td, str): # debug-log if not reported already
+				if td: td = f' - {td_repr(td)} / {td_repr(fetch_err_td)} of grace-period :'
+				feed_log.debug('Failed to fetch feed [ {} ]{}: {}', feed.title, td or '', err)
 		if entries is None: continue
 
 		ts_since = None
@@ -380,8 +496,8 @@ def main(args=None):
 			ts_since = feed.ts_last_check or ts_new_feed
 		log.debug( 'Processing feed:'
 			' entries={} etag={!r} new-since={}', len(entries), etag, ts_since )
-		emails, ewma_delay, seen_ids = \
-			feed_process(feed_log, feed, entries, ts, ts_since)
+		emails, ewma_delay, seen_ids = feed_process(
+			feed_log, feed, entries, ts, ts_since, ignore_shorts=opts.no_shorts )
 		if emails and not opts.dry_run:
 			log.debug( 'Sending notification emails:'
 				' count={} delay={:.1f}', len(emails), opts.email_delay )
@@ -391,10 +507,9 @@ def main(args=None):
 					['mail', '-s', subject, opts.email],
 					input=body.encode(), timeout=4*60, check=True )
 				ts_email = time.time()
-		update = dict(
-			chan=feed.chan, delay_ewma=ewma_delay,
+		if not opts.dry_run: state_update(
+			state_log, ts, feed, delay_ewma=ewma_delay,
 			ts_last_check=ts, etag=etag, seen_entries=seen_ids )
-		if not opts.dry_run: state_update(state_log, ts, feed, update)
 
 		if check_limit:
 			check_limit -= 1
