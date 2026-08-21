@@ -82,21 +82,22 @@ def td_parse(td_str):
 		return sum(n*float(m) for n,m in zip((3600, 60, 1), td_str.split(':')))
 	raise ValueError(f'Failed to parse time-delta spec: {td_str}')
 
-def td_repr(delta, units_max=2, units_res=None, _units=dict(
+def td_repr(delta, units_max=2, units_res=None, now='<1s', _units=dict(
 		h=3600, m=60, s=1, y=365.2422*86400, mo=30.5*86400, w=7*86400, d=1*86400 )):
 	res, s, n_last = list(), abs(delta), units_max - 1
 	units = sorted(_units.items(), key=lambda v: v[1], reverse=True)
 	for unit, unit_s in units:
-		val = math.floor(s / unit_s)
-		if not val:
+		if not (val := math.floor(val_raw := s / unit_s)):
 			if units_res == unit: break
 			continue
+		elif val_raw - val > 0.98: val += 1
 		if len(res) == n_last or units_res == unit:
 			val, n_last = round(s / unit_s), True
 		res.append(f'{val:.0f}{unit}')
 		if n_last is True: break
-		s -= val * unit_s
-	return ' '.join(res) if res else '<1s'
+		if (s := s - val * unit_s) < 1: break
+	return ' '.join(res) if res else now
+
 
 def retries_within_timeout(tries, timeout, delay_min=0, slack=None, e=10):
 	'Return list of delays to make exactly n retries within timeout'
@@ -144,11 +145,11 @@ def src_probe(p, vn=0, an=0, at=None, atts=False, pxfmts_10b=None):
 	'Return info on relevant streams in input file, filtered by vn/an options'
 	try: mtime = p.stat().st_mtime
 	except OSError: return adict(t='access', fatal=1, msg='File missing/inaccessible')
-	probe = sp.run( [ 'ffprobe', '-v', 'fatal',
-			'-show_entries', 'stream:format', '-print_format', 'json', str(p) ],
+	probe = sp.run( [ *( 'ffprobe -v fatal'
+			' -show_entries stream:format -print_format json' ).split(), str(p) ],
 		check=True, stdin=sp.DEVNULL, stdout=sp.PIPE )
 	vx, ax = vn, an; ac = sc = 0; probe = adict.rec_make(json.loads(probe.stdout))
-	video = audio = dict(); errs, subs, multistream = list(), list(), None
+	video = audio = dict(); errs, subs, multistream = list(), dict(), None
 	if (fmt := probe.format.format_name) in ['ass', 'srt', 'microdvd']:
 		return adict(t='format', fatal=1, msg=f'Subtitle file [{fmt}]')
 	for s in probe.streams:
@@ -164,7 +165,8 @@ def src_probe(p, vn=0, an=0, at=None, atts=False, pxfmts_10b=None):
 			if fps := s.get('avg_frame_rate') or 0:
 				if '/' not in fps: fps = float(fps)
 				else: a, b = map(float, fps.split('/')); fps = a and b and a/b
-			video = adict( n=vx, c=s.codec_name, fps=fps,
+			if dar := s.get('display_aspect_ratio'): dar = tuple(map(int, dar.split(':')))
+			video = adict( n=vx, c=s.codec_name, fps=fps, dar=dar,
 				w=s.width, h=s.height, pxf=s.pix_fmt, br=int(s.get('bit_rate') or 0) )
 
 		if ct == 'audio':
@@ -185,15 +187,18 @@ def src_probe(p, vn=0, an=0, at=None, atts=False, pxfmts_10b=None):
 			audio.enc.append(adict(c=s.codec_name, cn=s.channels))
 
 		if ct == 'subtitle':
-			if s.get('codec_name') in [None, 'dvb_subtitle', 'dvd_subtitle', 'hdmv_pgs_subtitle']:
-				errs.append(adict(t='subs', msg='Has bitmap or unrecognized subtitles'))
-			else: subs.append(sc)
+			if (cc := s.get('codec_name')) in [
+					None, 'dvb_subtitle', 'dvd_subtitle', 'hdmv_pgs_subtitle' ]:
+				if not cc: errs.append(adict(t='subs', msg='Has unrecognized subtitles'))
+				subs[sc] = cc and ... # can be left as-is if video is not scaled
+			else: subs[sc] = True
 			sc += 1
 
 	if not (audio and video):
 		errs.append(adict(t='format', fatal=1, msg='Missing/unmatched A/V streams'))
 	if multistream: errs.append(adict(t='format', fatal=1, msg='Multiple A/V streams'))
-	data = adict( v=video, a=audio, s=subs, atts=atts, errs=errs, mtime=mtime,
+	data = adict(
+		v=video, a=audio, s=subs, atts=atts, errs=errs, mtime=mtime,
 		td=float(probe.format.duration), sz=int(probe.format.size), desc=None )
 	data.desc = src_probe_desc(probe, data, pxfmts_10b)
 	return data
@@ -224,12 +229,14 @@ def src_probe_desc(p, d=dict(), pxfmts_10b=None):
 
 		if ct == 'video':
 			is_10b = pxfmts_10b and s.pix_fmt in pxfmts_10b
-			if all(wh := [s.get('width'), s.get('height')]):
-				sil1.append(wh := 'x'.join(map(str, wh)))
+			if all(wh_ints := [s.get('width'), s.get('height')]):
+				sil1.append(wh := 'x'.join(map(str, wh_ints)))
 				if is_10b: sil1[-1] += '.10b'
 				if ar := s.get('display_aspect_ratio'):
-					if (ars := s.get('sample_aspect_ratio')) != '1:1': ar += f'.{ars}'
-					if ar != wh.replace('x', ':'): sil1.append(f'[ {ar} ]')
+					(w, h), (dw, dh) = wh_ints, map(int, ar.split(':'))
+					if ar != wh.replace('x', ':') and not math.isclose(w/h, dw/dh, rel_tol=0.01):
+						if (ars := s.get('sample_aspect_ratio')) != '1:1': ar = f'{ars}>{ar}'
+						sil1.append(f'[ {ar} ]')
 			elif is_10b: sil1.append('10b')
 			if fps := s.get('avg_frame_rate'):
 				if '/' not in fps: fps = float(fps)
@@ -503,7 +510,7 @@ def main(args=None):
 	## Extract-attachments mode
 	if dst_dir := opts.extract_attachments:
 		if not (p_dst := pl.Path(dst_dir)).is_dir():
-			return err_func(f'Missing directory for -E/--extract-attachments [ {dst_dir} ]')
+			return parser.error(f'Missing directory for -E/--extract-attachments [ {dst_dir} ]')
 		return ffmpeg_extract_atts(src_list, p_dst, opts.force, opts.quiet)
 
 	## ffprobe checks
@@ -535,6 +542,8 @@ def main(args=None):
 		for a in p.a.enc: a.clone = a.c == 'opus' and a.cn <= 2
 		if all(a.clone for a in p.a.enc): errs.append(adict(
 			t='audio', warn=1, msg='Already encoded to ~2ch opus, will copy it as-is' ))
+		if p.v.scale and any(s is ... for s in p.s.values()): errs.append(adict(
+			t='subs', msg='Has bitmap subtitles that this script does not auto-scale' ))
 		# Last check for non-fatal errors
 		if _err_fail(errs, opts.print_probe and p.desc, opts.force, opts.quiet): continue
 		src_list[n], p.src = p, srcx
@@ -579,9 +588,12 @@ def main(args=None):
 	for n, p in enumerate(src_list, 1):
 		filters = list()
 		if p.v.resample: filters.append('fps=30')
-		if p.v.scale: filters.append(
-			"scale='if(gte(iw,ih),min(1280,iw),-2)"
-			":if(lt(iw,ih),min(1280,ih),-2)',setsar=1:1" )
+		if p.v.scale:
+			dw, dh = p.v.dar or (p.v.w, p.v.h)
+			if p.v.w >= p.v.h: w = min(1280, p.v.w); h = int(w * dh / dw)
+			else: h = min(1280, p.v.h); w = int(h * dw / dh)
+			for k, v in zip('wh', (w, h)): x, o = divmod(v, 2); p.v[k] = 2 * (x + (o >= 1))
+			filters.append(f'scale={p.v.w}:{p.v.h},setsar=1:1')
 		if filters: filters = ['-filter:v', sh_str_dq(','.join(filters))]
 		if fnopts := p.get('opts'):
 			filters = sum(([f'-{k}', v] for k, v in fnopts.items()), []) + filters
@@ -603,9 +615,11 @@ def main(args=None):
 		if vn or an or at or p.s or p.atts:
 			fmt.extend(( '-map', f'0:v:{max(p.v.n-1,0)}',
 				'-map', '0:a' if an is None else f'0:a:{max(p.a.n-1,0)}' ))
-			if subs := p.s.copy():
-				if subs == list(range(subs[-1] + 1)): fmt.extend(['-map', '0:s']); subs.clear()
-				for sn in subs: fmt.extend(['-map', f'0:s:{sn}'])
+			if any((subs := p.s.copy()).values()):
+				sc_chk = lambda v: v is True or (v is ... and not p.v.scale)
+				if all(sc_chk(v) for v in subs.values()): fmt.extend(['-map', '0:s']); subs.clear()
+				for sn, v in subs.items():
+					if sc_chk(v): fmt.extend(['-map', f'0:s:{sn}'])
 			if p.atts: fmt.extend(['-map', '0:t'])
 
 		cmd = [ 'ffmpeg', '-hide_banner', '-i', str(p.src), *filters,

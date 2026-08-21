@@ -3,7 +3,11 @@
 A set of a misc tools to work with files and processes.
 
 Various oldish helper scripts/binaries I wrote to help myself with
-day-to-day tasks.
+day-to-day tasks, and typically use on-and-off for years after that.
+
+Names of the scripts are usually unimaginative and follow their function in
+simple words, i.e. if it says "znc-log-reader" then it probably reads [ZNC] logs,
+and does nothing significant beyond that.
 
 License for all scripts is WTFPL (public domain-ish - [see below](#hdr-license__wtfpl_)),
 feel free to just copy and use these in whatever way you like.
@@ -28,13 +32,17 @@ Contents - links to doc section for each script here:
         - [docker-ln](#hdr-docker-ln)
         - [fast-disk-wipe](#hdr-fast-disk-wipe)
         - [lsx](#hdr-lsx)
-        - [trunc-filenames](#hdr-trunc-filenames)
+        - [hash-dedup](#hdr-hash-dedup)
+        - [rnm-hash](#hdr-rnm-hash)
+        - [rnm-trunc](#hdr-rnm-trunc)
+        - [rnm-simple](#hdr-rnm-simple)
         - [rmx.c](#hdr-rmx.c)
         - [dir-edit](#hdr-dir-edit)
 
     - [Various file-data processing tools](#hdr-various_file-data_processing_tools)
 
         - [repr](#hdr-repr)
+        - [rate-limit](#hdr-rate-limit)
         - [color](#hdr-color)
         - [resolve-hostnames](#hdr-resolve-hostnames)
         - [resolve-conf](#hdr-resolve-conf)
@@ -47,9 +55,9 @@ Contents - links to doc section for each script here:
         - [liac](#hdr-liac)
         - [html-embed](#hdr-html-embed)
         - [someml-indent](#hdr-someml-indent)
-        - [hashname](#hdr-hashname)
         - [hhash](#hdr-hhash)
         - [crypt](#hdr-crypt)
+        - [xx](#hdr-xx)
 
     - [Kernel sources/build/version management](#hdr-kernel_sources_build_version_management)
 
@@ -490,8 +498,49 @@ Or files within `-t/--mtime` vicinity/ranges:
 
 Simple python script with no extra dependencies.
 
-<a name=hdr-trunc-filenames></a>
-##### [trunc-filenames](trunc-filenames)
+<a name=hdr-hash-dedup></a>
+##### [hash-dedup](hash-dedup)
+
+Py script to check hashes of all files in a dir and either print (default),
+or do something with files that have matching contents, e.g. symlink all
+duplicates to one "original" file, or remove those - i.e. deduplicate files in a dir.
+
+Has somewhat complicated options for which file to keep, like `-S/--pick-sort`
+to order duplicates by some attribute (like name, name length, some name component,
+mtime, uid, etc) and pick first/last or Nth file from that list.\
+Or `-R/--pick-re` can be used to resolve conflicts by regexp-match,
+e.g. `-lR '!/_\d+\./'` to symlink all same-content `file_1.bin`, `file_2.bin`,
+etc to `file.bin`, using negative regexp-match to filter-out files with number-suffix.
+
+Only prints all duplicates and resulting `--pick-*` choices by default,
+when run without any action-related options.
+
+<a name=hdr-rnm-hash></a>
+##### [rnm-hash](rnm-hash)
+
+Script to add simple/distinctive base32-encoded content hash to filenames.
+
+For example:
+
+``` console
+% rnm-hash -p *.jpg
+
+wallpaper001.jpg -> wallpaper001.kw30e7cqytmmw.jpg
+wallpaper893.jpg -> wallpaper893.vbf0t0qht4dd0.jpg
+wallpaper895.jpg -> wallpaper895.q5mp0j95bxbdr.jpg
+wallpaper898.jpg -> wallpaper898.c9g9yeb06pdbj.jpg
+```
+
+For collecting files with commonly-repeated names into some dir,
+like random "wallpaper.jpg" or "image.jpg" images above from the internets.
+
+Can also be used with `-t/--tag` option to update names for changed files,
+which is handy in web-accessible dirs for changing URLs to invalidate caches.
+
+Use `-h/--help` for info on more useful options.
+
+<a name=hdr-rnm-trunc></a>
+##### [rnm-trunc](rnm-trunc)
 
 Python script to recursively shorten (truncate) file/directory names
 under specified byte-limit, respecting typical filename format, suffixes
@@ -508,6 +557,21 @@ always keeps longest filename possible under `-l/--max-len` limit,
 inserts unicode-ellipsis (…) character to indicate where truncation was made.
 
 Defaults to dry-run mode for safety, only printing all renames to be made.
+
+<a name=hdr-rnm-simple></a>
+##### [rnm-simple](rnm-simple)
+
+Python script to "simplify" filenames, to easily use those with different/simpler
+operating- and filesystems, e.g. on fat32 partition of embedded firmwares,
+which often can't handle spaces, long filenames, characters like `:`, `?` or `*`,
+or any non-ascii encodings in general.
+
+All renames are one-way lossy, often replacing different characters by same ascii ones,
+or just removing them entirely, so aside from visual similarity, no way to revert those.
+
+Uses [unidecode] module for unicode transliteration, if it's available, otherwise
+just strips any non-ascii (with a warning). Detects/aborts on filename conflicts,
+has `-v/--verbose` and `-n/--dry-run` modes.
 
 <a name=hdr-rmx.c></a>
 ##### [rmx.c](rmx.c)
@@ -583,6 +647,25 @@ Can also do encoding/newline conversion via -c option, as iconv can't do BOM or
 newlines, and sometimes you just want "MS utf-8 mode" (`repr -c utf-8-sig+r`).
 Using that with +i flag as e.g. `repr -c utf-8-sig+ri file1 file2 ...`
 converts encoding+newlines+BOM for files in-place at no extra hassle.
+
+<a name=hdr-rate-limit></a>
+##### [rate-limit](rate-limit)
+
+Python script to pass through or drop lines piped from stdin to stdout,
+depending on a simple [token bucket] rate-limiting algorithm,
+also indicating when dropping starts.
+
+Somewhat similar to `pv --quiet --line-mode --rate-limit <n>`,
+but without delaying/buffering anything in-between ([pv] delays output),
+with more useful algorithm (to pass through a burst of lines before drop),
+plus necessary indication that something will be missing (and for how long).
+
+Intended for low line-traffic sources like logging, where occasional
+massive spam/noise is highly undesirable, rarely useful, and usually
+redundant and/or a bug (e.g. stuck loop with logging call in it).
+
+[pv]: https://www.ivarch.com/programs/pv.shtml
+[token bucket]: https://en.wikipedia.org/wiki/Token_bucket
 
 <a name=hdr-color></a>
 ##### [color](color)
@@ -944,30 +1027,6 @@ it can be trusted not to do anything unnecessary like stuff mentioned above.
 
 For cases when `xmllint --format` fail and/or break such kinda-ML-but-not-XML files.
 
-<a name=hdr-hashname></a>
-##### [hashname](hashname)
-
-Script to add simple/distinctive base32-encoded content hash to filenames.
-
-For example:
-
-``` console
-% hashnames -p *.jpg
-
-wallpaper001.jpg -> wallpaper001.kw30e7cqytmmw.jpg
-wallpaper893.jpg -> wallpaper893.vbf0t0qht4dd0.jpg
-wallpaper895.jpg -> wallpaper895.q5mp0j95bxbdr.jpg
-wallpaper898.jpg -> wallpaper898.c9g9yeb06pdbj.jpg
-```
-
-For collecting files with commonly-repeated names into some dir,
-like random "wallpaper.jpg" or "image.jpg" images above from the internets.
-
-Can also be used with -t/--tag option to update names for changed files,
-which is handy in web-accessible dirs for changing URLs to invalidate caches.
-
-Use -h/--help for info on more useful options.
-
 <a name=hdr-hhash></a>
 ##### [hhash](hhash.ml)
 
@@ -1031,6 +1090,22 @@ be bad if there's a flipped bit anywhere in the encrypted data - decryption will
 stop and throw error at that point.
 
 [PyNaCl's]: https://pynacl.readthedocs.io/
+
+<a name=hdr-xx></a>
+##### [xx](xx)
+
+Wrapper around [bsdtar] to one-command extract any archive(s) to own subdir(s).\
+E.g. `xx data.2026-07-25.zip` to extract it to `data.2026-07-25`,
+or `xx *.zip` to easily turn a bunch of archives into dirs.
+
+Always extracts archives into subdirs under cwd, which isn't necessarily
+where source archives are.
+Has `-r` mode to replace unpacked dirs, e.g. to start over after some failed
+file-mangling there, and `-R` mode to cleanup via otherwise-same command.
+
+bsdtar/libarchive used in the tool should support all common archive formats.
+
+[bsdtar]: https://libarchive.org/
 
 
 
@@ -1128,7 +1203,7 @@ archive, view, search, etc.
 <a name=hdr-znc-log-aggregator></a>
 ##### [znc-log-aggregator](znc-log-aggregator)
 
-Tool to process ZNC chat logs, produced by "log" module (one enabled globally,
+Tool to process [ZNC] chat logs, produced by "log" module (one enabled globally,
 with default wildcards) and store them using following schema under some -d/--log-dir:
 
     <net>/chat/<channel>__<yy>-<mm>.log.xz
@@ -1158,6 +1233,8 @@ usage of uncompressed logs in the long run.
 
 ZNC changed how it stores logs a few times over the years, and this tools
 also helped maintain consistent storage schema across these.
+
+[ZNC]: https://znc.in/
 
 <a name=hdr-znc-log-reader></a>
 ##### [znc-log-reader](znc-log-reader)
@@ -2195,44 +2272,54 @@ Misc notes:
 <a name=hdr-audit-follow></a>
 ##### [audit-follow](audit-follow)
 
-Simple py3 script to decode audit messages from "journalctl -af -o json" output,
-i.e. stuff like this:
+Python script to decode audit messages from `journalctl -af -o json` output,
+auditd logs, or syslog with audit records, i.e. stuff like this:
 
-    Jul 24 17:14:01 malediction audit: PROCTITLE
+    Jul 24 17:14:01 myhost audit: PROCTITLE
       proctitle=7368002D630067726570202D652044... (loooong hex-encoded string)
-    Jul 24 17:14:01 malediction audit: SOCKADDR saddr=020000517F0000010000000000000000
+    Jul 24 17:14:01 myhost audit: SOCKADDR saddr=020000517F0000010000000000000000
 
 Into this:
 
-    PROCTITLE proctitle='sh -c grep -e Dirty: -e Writeback: /proc/meminfo'
+    PROCTITLE proctitle="sh -c grep -e Dirty: -e Writeback: /proc/meminfo"
     SOCKADDR saddr=127.0.0.1:81
 
-Filters for audit messages only, strips long audit-id/time prefixes,
-unless -a/--all specified, puts separators between multi-line audit reports,
-relative and/or differential timestamps (-r/--reltime and -d/--difftime opts).
+Filters for audit messages when using journal/syslog inputs, strips long
+audit-id/time prefixes (optionally replacing by short/distinctive tags),
+puts separators between multi-line/record audit events, has many options for
+various timestamp/time-offset prefixes, can do complex filtering and other stuff.
 
-Audit subsystem can be very useful to understand which process modifies some
-path, what's the command-line of some /bin/bash being run from somewhere
-occasionally, or what process/command-line connects to some specific IP and what
-scripts it opens beforehand - all without need for gdb/strace, or where they're
-inapplicable.
+Uses [auditd/auparse python bindings] to split/decode fields in input messages,
+but mostly ignores any audit-specific type information there, focusing on readable
+string output.
 
-Some useful incantations (cheatsheet):
+Haven't found filtering in auditd to be sufficient for long-term monitoring,
+so script includes somewhat advanced -f/--filter-file system, to filter-out specific
+events or records within those, using a chain of pass/drop rules (like filter rules
+in rsync or firewall), which allow for regexp-matching records/events or specific fields,
+logically combining/negating such checks, filtering non-audit errors in input pipe, etc.
+Run with `-f help` for more information on syntax and how those work.
 
-    # auditctl -e 1
-    # auditctl -a exit,always -S execve -F path=/bin/bash
-    # auditctl -a exit,always -F auid=1001 -S open -S openat
-    # auditctl -w /some/important/path/ -p rwxa
-    # auditctl -a exit,always -F arch=b64 -S connect
+Where "long-term monitoring" use-case is to forward filtered auditd events
+to some remote/monitored syslog stream, without unasked-for kernel noise,
+but keeping full unfiltered local auditd.log as well (for extra context and backup):
 
-    # audit-follow -ro='--since=-30min SYSLOG_IDENTIFIER=audit' |
-      grep --line-buffered -B1000 -F some-interesting-stuff | tee -a audit.log
+    # tail -qn0 -F /run/audit/audit.log 2>&1 |
+      audit-follow -Pif /etc/audit/filters.conf |
+      rate-limit 10/10m:100 | logger -t audit -p local3.info
 
-    # auditctl -e 0
-    # auditctl -D
+More powerful options for such system-wide monitoring/observability/debugging on linux
+can be [bcc], [sysdig], [dtrace4linux], [bpftrace], [fanotify] (e.g. [fatrace]), [cilium],
+[sysmon] and other more modern eBPF-based tools, but good old audit can still work
+for LSM monitoring, simple debug checks or anomaly detection.
 
-auditd + ausearch can be used as an offline/advanced alternative to such script.\
-More powerful options for such task on linux can be sysdig and various BPF tools.
+[auditd/auparse python bindings]: https://github.com/linux-audit/audit-userspace/
+[bcc]: https://github.com/iovisor/bcc
+[sysdig]: https://github.com/draios/sysdig
+[dtrace4linux]: https://github.com/dtrace4linux/linux
+[bpftrace]: https://bpftrace.org/
+[cilium]: https://cilium.io/
+[sysmon]: https://github.com/microsoft/SysmonForLinux
 
 <a name=hdr-tui-binary-conv></a>
 ##### [tui-binary-conv](tui-binary-conv)
